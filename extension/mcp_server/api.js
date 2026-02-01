@@ -606,14 +606,48 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Message not found: ${messageId}` };
                 }
 
-                // Thunderbird message header API
+                const desiredRead = !!read;
+
+                /**
+                 * IMPORTANT:
+                 * - msgHdr.markRead(...) updates the local message database.
+                 * - For IMAP accounts, that may NOT propagate the \"\\Seen\" flag
+                 *   back to the server (so other clients / Outlook Web won't update).
+                 *
+                 * To ensure server sync, prefer folder.markMessagesRead(...).
+                 */
+                let used = null;
+
+                // Try to mark read via folder API (propagates to server for IMAP).
+                // Thunderbird's JS folder helpers typically expect a plain JS array of nsIMsgDBHdr.
                 try {
-                  msgHdr.markRead(!!read);
-                } catch (e) {
-                  return { error: `Failed to mark read: ${e.toString()}` };
+                  const hdrFolder = msgHdr.folder || folder;
+                  if (hdrFolder && typeof hdrFolder.markMessagesRead === "function") {
+                    hdrFolder.markMessagesRead([msgHdr], desiredRead);
+                    used = "folder.markMessagesRead";
+                  }
+                } catch {
+                  // Fall back below.
                 }
 
-                return { success: true, messageId, folderPath, read: !!read };
+                // Fallback: local-only header flag.
+                if (!used) {
+                  try {
+                    msgHdr.markRead(desiredRead);
+                    used = "msgHdr.markRead";
+                  } catch (e) {
+                    return { error: `Failed to mark read: ${e.toString()}` };
+                  }
+                }
+
+                // Encourage committing changes to the local DB.
+                try {
+                  if (folder.msgDatabase && folder.msgDatabase.Commit) {
+                    folder.msgDatabase.Commit(Ci.nsMsgDBCommitType.kLargeCommit);
+                  }
+                } catch {}
+
+                return { success: true, messageId, folderPath, read: desiredRead, used };
               } catch (e) {
                 return { error: e.toString() };
               }
