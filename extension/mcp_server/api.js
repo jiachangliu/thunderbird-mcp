@@ -120,6 +120,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath", "body"],
         },
       },
+      {
+        name: "setMessageRead",
+        title: "Mark Message Read/Unread",
+        description: "Mark a specific message as read or unread",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            read: { type: "boolean", description: "true to mark read, false to mark unread" }
+          },
+          required: ["messageId", "folderPath", "read"],
+        },
+      },
     ];
 
     return {
@@ -568,6 +582,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *
              * Limitation: Does not include quoted original message text.
              */
+            function setMessageRead(messageId, folderPath, read) {
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                const db = folder.msgDatabase;
+                if (!db) {
+                  return { error: "Could not access folder database" };
+                }
+
+                let msgHdr = null;
+                for (const hdr of db.enumerateMessages()) {
+                  if (hdr.messageId === messageId) {
+                    msgHdr = hdr;
+                    break;
+                  }
+                }
+
+                if (!msgHdr) {
+                  return { error: `Message not found: ${messageId}` };
+                }
+
+                // Thunderbird message header API
+                try {
+                  msgHdr.markRead(!!read);
+                } catch (e) {
+                  return { error: `Failed to mark read: ${e.toString()}` };
+                }
+
+                return { success: true, messageId, folderPath, read: !!read };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             function replyToMessage(messageId, folderPath, body, replyAll, isHtml) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
@@ -659,6 +710,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getMessage(args.messageId, args.folderPath);
                 case "getLatestUnread":
                   return await getLatestUnread(args.folderPath);
+                case "setMessageRead":
+                  return setMessageRead(args.messageId, args.folderPath, args.read);
                 case "searchContacts":
                   return searchContacts(args.query || "");
                 case "listCalendars":
