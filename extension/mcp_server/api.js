@@ -46,6 +46,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getLatestUnread",
+        title: "Get Latest Unread",
+        description: "Return the most recent unread message from a folder (defaults to Inbox)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (e.g., imap://.../INBOX). Defaults to the account Inbox." }
+          },
+          required: [],
+        },
+      },
+      {
         name: "getMessage",
         title: "Get Message",
         description: "Read the full content of an email message by its ID",
@@ -268,6 +280,78 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch (e) {
                 return { error: e.toString() };
               }
+            }
+
+            function getFolderOrInbox(folderPath) {
+              if (folderPath) {
+                const f = MailServices.folderLookup.getFolderForURL(folderPath);
+                return f || null;
+              }
+              try {
+                const defaultAccount = MailServices.accounts.defaultAccount;
+                if (!defaultAccount) return null;
+                const root = defaultAccount.incomingServer.rootFolder;
+                // Prefer folder flagged as Inbox if available.
+                try {
+                  const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+                  if (inbox) return inbox;
+                } catch {
+                  // fallthrough
+                }
+                // Fallback: first child named INBOX
+                for (const sub of root.subFolders) {
+                  if ((sub.prettyName || "").toUpperCase() === "INBOX" || (sub.name || "").toUpperCase() === "INBOX") {
+                    return sub;
+                  }
+                }
+                return root;
+              } catch {
+                return null;
+              }
+            }
+
+            function getLatestUnread(folderPath) {
+              return new Promise((resolve) => {
+                try {
+                  const folder = getFolderOrInbox(folderPath);
+                  if (!folder) {
+                    resolve({ error: folderPath ? `Folder not found: ${folderPath}` : "Inbox folder not found" });
+                    return;
+                  }
+
+                  // Nudge IMAP sync.
+                  try {
+                    if (folder.server && folder.server.type === "imap") folder.updateFolder(null);
+                  } catch {}
+
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    resolve({ error: "Could not access folder database" });
+                    return;
+                  }
+
+                  let latest = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (!hdr.isRead) {
+                      if (!latest || (hdr.date || 0) > (latest.date || 0)) {
+                        latest = hdr;
+                      }
+                    }
+                  }
+
+                  if (!latest) {
+                    resolve({ ok: true, message: "No unread messages found in folder", folderPath: folder.URI });
+                    return;
+                  }
+
+                  // Reuse getMessage to extract body
+                  getMessage(latest.messageId, folder.URI).then((msg) => {
+                    resolve(msg);
+                  });
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
             }
 
             function getMessage(messageId, folderPath) {
@@ -573,6 +657,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return searchMessages(args.query || "");
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath);
+                case "getLatestUnread":
+                  return await getLatestUnread(args.folderPath);
                 case "searchContacts":
                   return searchContacts(args.query || "");
                 case "listCalendars":
