@@ -302,6 +302,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     "resource:///modules/gloda/MimeMessage.sys.mjs"
                   );
 
+                  function htmlToText(html) {
+                    if (!html || typeof html !== "string") return "";
+                    try {
+                      // DOMParser is available in the extension context.
+                      const doc = new DOMParser().parseFromString(html, "text/html");
+                      const text = (doc && doc.body && doc.body.textContent) ? doc.body.textContent : "";
+                      return text
+                        .replace(/\r\n/g, "\n")
+                        .replace(/\n{3,}/g, "\n\n")
+                        .trim();
+                    } catch {
+                      // Fallback: strip tags naively
+                      return html
+                        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+                        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+                        .replace(/<[^>]+>/g, " ")
+                        .replace(/\s+/g, " ")
+                        .trim();
+                    }
+                  }
+
                   function extractFromParts(part) {
                     if (!part) return { textPlain: "", textHtml: "" };
 
@@ -339,6 +360,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     let body = "";
                     let bodyHtml = "";
+                    let bodyText = "";
                     let bodyType = "unknown";
 
                     // 1) Preferred: Thunderbird's coercion to plaintext
@@ -346,6 +368,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       const coerced = aMimeMsg.coerceBodyToPlaintext();
                       if (coerced && typeof coerced === "string") {
                         body = sanitizeForJson(coerced);
+                        bodyText = body;
                         bodyType = "text/plain";
                       }
                     } catch {
@@ -358,9 +381,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const extracted = extractFromParts(aMimeMsg);
                         if (extracted.textPlain) {
                           body = sanitizeForJson(extracted.textPlain);
+                          bodyText = body;
                           bodyType = "text/plain";
                         } else if (extracted.textHtml) {
                           bodyHtml = sanitizeForJson(extracted.textHtml);
+                          bodyText = sanitizeForJson(htmlToText(bodyHtml));
                           bodyType = "text/html";
                           body = "(HTML body available in bodyHtml)";
                         }
@@ -382,6 +407,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       body,
                       bodyType,
+                      bodyText,
                       bodyHtml
                     });
                   }, true, { examineEncryptedParts: true });
