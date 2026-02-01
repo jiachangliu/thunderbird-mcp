@@ -58,6 +58,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getLatestUnreadBatch",
+        title: "Get Latest Unread (Batch)",
+        description: "Return up to N most recent unread messages from a folder WITHOUT changing read/unread state",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (e.g., imap://.../INBOX). Defaults to the account Inbox." },
+            limit: { type: "number", description: "Max number of unread messages to return (default: 10, max: 50)" }
+          },
+          required: [],
+        },
+      },
+      {
         name: "getMessage",
         title: "Get Message",
         description: "Read the full content of an email message by its ID",
@@ -362,6 +375,51 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   getMessage(latest.messageId, folder.URI).then((msg) => {
                     resolve(msg);
                   });
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
+            function getLatestUnreadBatch(folderPath, limit) {
+              return new Promise((resolve) => {
+                try {
+                  const folder = getFolderOrInbox(folderPath);
+                  if (!folder) {
+                    resolve({ error: folderPath ? `Folder not found: ${folderPath}` : "Inbox folder not found" });
+                    return;
+                  }
+
+                  // Nudge IMAP sync.
+                  try {
+                    if (folder.server && folder.server.type === "imap") folder.updateFolder(null);
+                  } catch {}
+
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    resolve({ error: "Could not access folder database" });
+                    return;
+                  }
+
+                  const n = Math.max(1, Math.min(50, Number(limit || 10)));
+
+                  // Collect unread headers, then sort by date descending.
+                  const unread = [];
+                  for (const hdr of db.enumerateMessages()) {
+                    if (!hdr.isRead) unread.push(hdr);
+                  }
+
+                  unread.sort((a, b) => (b.date || 0) - (a.date || 0));
+                  const selected = unread.slice(0, n);
+
+                  if (selected.length === 0) {
+                    resolve({ ok: true, message: "No unread messages found in folder", folderPath: folder.URI, items: [] });
+                    return;
+                  }
+
+                  Promise.all(selected.map(h => getMessage(h.messageId, folder.URI)))
+                    .then((items) => resolve({ ok: true, folderPath: folder.URI, count: items.length, items }))
+                    .catch((e) => resolve({ error: e.toString() }));
                 } catch (e) {
                   resolve({ error: e.toString() });
                 }
@@ -744,6 +802,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getMessage(args.messageId, args.folderPath);
                 case "getLatestUnread":
                   return await getLatestUnread(args.folderPath);
+                case "getLatestUnreadBatch":
+                  return await getLatestUnreadBatch(args.folderPath, args.limit);
                 case "setMessageRead":
                   return setMessageRead(args.messageId, args.folderPath, args.read);
                 case "searchContacts":
