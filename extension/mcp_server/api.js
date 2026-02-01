@@ -302,6 +302,35 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     "resource:///modules/gloda/MimeMessage.sys.mjs"
                   );
 
+                  function extractFromParts(part) {
+                    if (!part) return { textPlain: "", textHtml: "" };
+
+                    // Some parts are leaf nodes with body; others have sub-parts.
+                    const ct = (part.contentType || "").toLowerCase();
+                    const body = typeof part.body === "string" ? part.body : "";
+
+                    let textPlain = "";
+                    let textHtml = "";
+
+                    if (ct.startsWith("text/plain") && body) {
+                      textPlain = body;
+                    } else if (ct.startsWith("text/html") && body) {
+                      textHtml = body;
+                    }
+
+                    // Recurse
+                    if (Array.isArray(part.parts)) {
+                      for (const sub of part.parts) {
+                        const subRes = extractFromParts(sub);
+                        if (!textPlain && subRes.textPlain) textPlain = subRes.textPlain;
+                        if (!textHtml && subRes.textHtml) textHtml = subRes.textHtml;
+                        if (textPlain && textHtml) break;
+                      }
+                    }
+
+                    return { textPlain, textHtml };
+                  }
+
                   MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
                     if (!aMimeMsg) {
                       resolve({ error: "Could not parse message" });
@@ -309,10 +338,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                     let body = "";
+                    let bodyHtml = "";
+                    let bodyType = "unknown";
+
+                    // 1) Preferred: Thunderbird's coercion to plaintext
                     try {
-                      // sanitizeForJson removes control chars that break JSON
-                      body = sanitizeForJson(aMimeMsg.coerceBodyToPlaintext());
+                      const coerced = aMimeMsg.coerceBodyToPlaintext();
+                      if (coerced && typeof coerced === "string") {
+                        body = sanitizeForJson(coerced);
+                        bodyType = "text/plain";
+                      }
                     } catch {
+                      // fallthrough
+                    }
+
+                    // 2) Fallback: traverse MIME parts and pick first text/plain or text/html
+                    if (!body) {
+                      try {
+                        const extracted = extractFromParts(aMimeMsg);
+                        if (extracted.textPlain) {
+                          body = sanitizeForJson(extracted.textPlain);
+                          bodyType = "text/plain";
+                        } else if (extracted.textHtml) {
+                          bodyHtml = sanitizeForJson(extracted.textHtml);
+                          bodyType = "text/html";
+                          body = "(HTML body available in bodyHtml)";
+                        }
+                      } catch {
+                        // fallthrough
+                      }
+                    }
+
+                    if (!body && !bodyHtml) {
                       body = "(Could not extract body text)";
                     }
 
@@ -323,7 +380,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       recipients: msgHdr.recipients,
                       ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                      body
+                      body,
+                      bodyType,
+                      bodyHtml
                     });
                   }, true, { examineEncryptedParts: true });
 
