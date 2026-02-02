@@ -922,6 +922,72 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            function _saveDraftViaComposeWindow({ identity, to, cc, subject, bodyHtml }) {
+              // Uses Thunderbird's native Save-as-Draft via nsIMsgCompose.SendMsg,
+              // which should set the correct server-side draft/unsent flags for Outlook Web.
+              return new Promise((resolve) => {
+                try {
+                  const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
+
+                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
+                  const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"].createInstance(Ci.nsIMsgCompFields);
+
+                  composeFields.to = to || "";
+                  composeFields.cc = cc || "";
+                  composeFields.subject = subject || "";
+                  composeFields.body = bodyHtml || "";
+
+                  msgComposeParams.type = Ci.nsIMsgCompType.New;
+                  msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                  msgComposeParams.composeFields = composeFields;
+                  if (identity) msgComposeParams.identity = identity;
+
+                  const observer = {
+                    observe(subjectWin, topic) {
+                      if (topic !== "domwindowopened") return;
+                      const win = subjectWin;
+                      win.addEventListener(
+                        "load",
+                        () => {
+                          try {
+                            const url = String(win.location);
+                            if (!url.includes("messengercompose")) return;
+
+                            // Give the editor a moment to initialize, then save draft.
+                            const runnable = {
+                              run: () => {
+                                try {
+                                  const comp = msgComposeService.GetMsgComposeForWindow(win);
+                                  const sendFn = comp && (comp.SendMsg || comp.sendMsg);
+                                  if (typeof sendFn === "function") {
+                                    sendFn.call(comp, Ci.nsIMsgSend.nsMsgSaveAsDraft, identity || null, null, null, null);
+                                  }
+                                } catch {}
+
+                                // Close after another moment.
+                                const closeRun = { run: () => { try { win.close(); } catch {} try { Services.ww.unregisterNotification(observer); } catch {} resolve({ ok: true }); } };
+                                Services.tm.dispatchToMainThread(closeRun);
+                              },
+                            };
+                            Services.tm.dispatchToMainThread(runnable);
+                          } catch {
+                            try { Services.ww.unregisterNotification(observer); } catch {}
+                            resolve({ ok: false });
+                          }
+                        },
+                        { once: true }
+                      );
+                    },
+                  };
+
+                  Services.ww.registerNotification(observer);
+                  msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+                } catch {
+                  resolve({ ok: false });
+                }
+              });
+            }
+
             function _findDraftByMessageId(folder, messageId) {
               try {
                 const db = folder.msgDatabase;
@@ -1299,20 +1365,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Duplicate prevention: deterministic Message-ID based on original message-id + body hash
                 const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${composeFields.to}|${composeFields.subject}|${finalBodyHtml || finalBody}`)}`;
 
-                // Save reply draft by appending an RFC822 message directly into the identity's Drafts folder.
-                const { rfc822, messageId: draftMessageId } = _makeRfc822Draft({
-                  from: _formatFrom(identity),
-                  to: composeFields.to || "",
-                  cc: composeFields.cc || "",
-                  subject: composeFields.subject || "",
-                  body: finalBodyHtml || finalBody,
-                  inReplyTo: msgHdr.messageId,
-                  references: composeFields.references || "",
-                  idempotencyKey: key,
-                  identityKey: identity ? identity.key : "",
-                  fcc: "",
-                  isHtml: !!finalBodyHtml,
-                });
+                // Prefer native Thunderbird Save-as-Draft (sets correct server flags for Outlook Web).
+                // We still keep idempotency via a deterministic synthetic id check in Drafts if possible.
+
+                const draftMessageId = `tb-mcp-draft-${_sanitizeMessageIdToken(key)}@${_getEmailDomain(identity)}`;
 
                 if (_pendingDraftMessageIds.has(draftMessageId)) {
                   return { success: true, message: "Reply draft already pending (idempotent)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
@@ -1323,30 +1379,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { success: true, message: "Reply draft already exists (idempotent)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
                 }
 
-                const file = _writeStringToTempFileUtf8("tb-mcp-reply-draft", rfc822);
                 _pendingDraftMessageIds.add(draftMessageId);
+
+                // Build HTML body to mimic Thunderbird quote style.
+                const bodyHtml = finalBodyHtml || `<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body><p>${String(body || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>")}</p></body></html>`;
 
                 const runnable = {
                   run: () => {
-                    _copyFileToFolderAsDraft(file, draftsFolder, 30000)
-                      .then(() => {
-                        try { draftsFolder.updateFolder(null); } catch {}
-                        try { Services.console.logStringMessage(`thunderbird-mcp: reply draft saved to ${draftsURI}`); } catch {}
-                      })
-                      .catch((e) => {
-                        try { Services.console.logStringMessage(`thunderbird-mcp: reply draft save failed: ${e}`); } catch {}
-                      })
-                      .finally(() => {
-                        try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
-                        try { _pendingTimers.delete(runnable); } catch {}
-                      });
+                    _saveDraftViaComposeWindow({
+                      identity,
+                      to: composeFields.to || "",
+                      cc: composeFields.cc || "",
+                      subject: /^\s*re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`,
+                      bodyHtml,
+                    }).finally(() => {
+                      try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
+                      try { _pendingTimers.delete(runnable); } catch {}
+                    });
                   },
                 };
 
                 _pendingTimers.add(runnable);
                 Services.tm.dispatchToMainThread(runnable);
 
-                return { success: true, message: "Reply draft save scheduled (backend copy)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
+                return { success: true, message: "Reply draft save scheduled (native SaveAsDraft)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
               } catch (e) {
                 return { error: e.toString() };
               }
