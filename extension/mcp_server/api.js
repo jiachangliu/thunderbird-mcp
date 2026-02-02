@@ -675,138 +675,145 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function saveDraft(to, subject, body, cc, isHtml) {
+            function _getDraftsFolderURIForIdentity(identity) {
               try {
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                  .getService(Ci.nsIMsgComposeService);
+                if (!identity || !identity.key) return "";
+                return Services.prefs.getCharPref(`mail.identity.${identity.key}.draft_folder`, "");
+              } catch {
+                return "";
+              }
+            }
 
-                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                  .createInstance(Ci.nsIMsgComposeParams);
+            function _formatFrom(identity) {
+              const email = (identity && identity.email) ? identity.email : "";
+              const name = (identity && identity.fullName) ? identity.fullName : "";
+              if (name && email) return `"${name}" <${email}>`;
+              return email || "";
+            }
 
-                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                  .createInstance(Ci.nsIMsgCompFields);
+            function _normalizeCRLF(text) {
+              return String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, "\r\n");
+            }
 
-                composeFields.to = to || "";
-                composeFields.cc = cc || "";
-                composeFields.subject = subject || "";
+            function _makeRfc822Draft({ from, to, cc, subject, body, inReplyTo, references }) {
+              const headers = [];
+              headers.push(`From: ${from}`);
+              if (to) headers.push(`To: ${to}`);
+              if (cc) headers.push(`Cc: ${cc}`);
+              if (subject !== undefined) headers.push(`Subject: ${subject || ""}`);
+              headers.push(`Date: ${new Date().toUTCString()}`);
+              headers.push(`Message-ID: <tb-mcp-draft-${Date.now()}@local>`);
+              if (inReplyTo) headers.push(`In-Reply-To: <${inReplyTo.replace(/[<>]/g, "")}>`);
+              if (references) headers.push(`References: ${references}`);
+              headers.push("MIME-Version: 1.0");
+              headers.push("Content-Type: text/plain; charset=UTF-8");
+              headers.push("Content-Transfer-Encoding: 8bit");
+              // Mark as a draft for some servers/clients.
+              headers.push("X-Mozilla-Draft-Info: internal/draft");
 
-                if (isHtml) {
-                  let bodyText = (body || "").replace(/\n/g, '');
-                  bodyText = [...bodyText].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
-                  composeFields.body = bodyText.includes('<html')
-                    ? bodyText
-                    : `<html><head><meta charset="UTF-8"></head><body>${bodyText}</body></html>`;
-                } else {
-                  const htmlBody = (body || "")
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/\n/g, '<br>');
-                  composeFields.body = `<html><body>${htmlBody}</body></html>`;
+              return headers.join("\r\n") + "\r\n\r\n" + _normalizeCRLF(body || "") + "\r\n";
+            }
+
+            function _writeStringToTempFileUtf8(filenamePrefix, content) {
+              const tmp = Services.dirsvc.get("TmpD", Ci.nsIFile);
+              tmp.append(`${filenamePrefix}-${Date.now()}.eml`);
+              tmp.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
+
+              const foStream = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
+              foStream.init(tmp, 0x02 | 0x08 | 0x20, 0o600, 0); // write | create | truncate
+
+              const conv = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(Ci.nsIConverterOutputStream);
+              conv.init(foStream, "UTF-8");
+              conv.writeString(String(content));
+              conv.close();
+              foStream.close();
+
+              return tmp;
+            }
+
+            function _copyFileToFolderAsDraft(file, folder) {
+              return new Promise((resolve, reject) => {
+                try {
+                  const copyService = MailServices.copy;
+
+                  const listener = {
+                    QueryInterface: ChromeUtils.generateQI([Ci.nsIMsgCopyServiceListener]),
+                    OnStartCopy() {},
+                    OnProgress() {},
+                    SetMessageKey() {},
+                    GetMessageId() {},
+                    OnStopCopy(status) {
+                      try {
+                        if (status && !Components.isSuccessCode(status)) {
+                          reject(new Error(`Copy failed: ${status}`));
+                          return;
+                        }
+                        resolve(true);
+                      } catch (e) {
+                        reject(e);
+                      }
+                    },
+                  };
+
+                  let flags = 0;
+                  try {
+                    flags = Ci.nsMsgMessageFlags.Draft;
+                  } catch {
+                    flags = 0;
+                  }
+
+                  copyService.CopyFileMessage(
+                    file,
+                    folder,
+                    null,
+                    false,
+                    flags,
+                    "",
+                    listener,
+                    null
+                  );
+                } catch (e) {
+                  reject(e);
                 }
+              });
+            }
 
-                msgComposeParams.type = Ci.nsIMsgCompType.New;
-                msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
-                msgComposeParams.composeFields = composeFields;
+            async function saveDraft(to, subject, body, cc, isHtml) {
+              try {
+                if (isHtml) {
+                  return { error: "saveDraft currently supports isHtml=false only (plain text)" };
+                }
 
                 const defaultAccount = MailServices.accounts.defaultAccount;
                 const identity = defaultAccount ? defaultAccount.defaultIdentity : null;
-                if (identity) {
-                  msgComposeParams.identity = identity;
+                if (!identity) {
+                  return { error: "No default identity found" };
                 }
 
-                // We intentionally open the compose window briefly, save to Drafts, then close.
-                // This avoids relying on nsIMsgCompose.SendMsg (which is not exposed in some builds).
-                const observer = {
-                  observe(subject, topic) {
-                    if (topic !== "domwindowopened") return;
-                    const win = subject;
-                    win.addEventListener(
-                      "load",
-                      () => {
-                        try {
-                          const url = String(win.location);
-                          if (!url.includes("messengercompose")) return;
+                const draftsURI = _getDraftsFolderURIForIdentity(identity);
+                if (!draftsURI) {
+                  return { error: "Could not determine Drafts folder URI for identity" };
+                }
 
-                          // Save draft after a short delay to ensure the editor + commands are ready.
-                          const t1 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                          t1.init(
-                            {
-                              notify: () => {
-                                // Prefer direct nsIMsgCompose access for this window.
-                                let saved = false;
-                                try {
-                                  if (typeof msgComposeService.GetMsgComposeForWindow === "function") {
-                                    const comp = msgComposeService.GetMsgComposeForWindow(win);
-                                    if (comp) {
-                                      const sendFn = comp.SendMsg || comp.sendMsg;
-                                      if (typeof sendFn === "function") {
-                                        sendFn.call(comp, Ci.nsIMsgSend.nsMsgSaveAsDraft, msgComposeParams.identity || null, null, null, null);
-                                        saved = true;
-                                      }
-                                    }
-                                  }
-                                } catch {}
+                const draftsFolder = MailServices.folderLookup.getFolderForURL(draftsURI);
+                if (!draftsFolder) {
+                  return { error: `Drafts folder not found: ${draftsURI}` };
+                }
 
-                                // Fallback to UI commands.
-                                if (!saved) {
-                                  try {
-                                    if (typeof win.goDoCommand === "function") {
-                                      win.goDoCommand("cmd_saveAsDraft");
-                                      saved = true;
-                                    }
-                                  } catch {}
-                                }
+                const rfc822 = _makeRfc822Draft({
+                  from: _formatFrom(identity),
+                  to: to || "",
+                  cc: cc || "",
+                  subject: subject || "",
+                  body: body || "",
+                });
 
-                                if (!saved) {
-                                  try {
-                                    const cmd = win.document && win.document.getElementById && win.document.getElementById("cmd_saveAsDraft");
-                                    if (cmd && typeof cmd.doCommand === "function") {
-                                      cmd.doCommand();
-                                      saved = true;
-                                    }
-                                  } catch {}
-                                }
+                const file = _writeStringToTempFileUtf8("tb-mcp-draft", rfc822);
+                await _copyFileToFolderAsDraft(file, draftsFolder);
 
-                                if (!saved) {
-                                  try {
-                                    if (typeof win.SaveAsDraft === "function") {
-                                      win.SaveAsDraft();
-                                      saved = true;
-                                    }
-                                  } catch {}
-                                }
+                try { draftsFolder.updateFolder(null); } catch {}
 
-                                // Give IMAP/Outlook time to enqueue the draft, then close.
-                                const t2 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                t2.init(
-                                  {
-                                    notify: () => {
-                                      try { win.close(); } catch {}
-                                      try { Services.ww.unregisterNotification(observer); } catch {}
-                                    },
-                                  },
-                                  12000,
-                                  Ci.nsITimer.TYPE_ONE_SHOT
-                                );
-                              },
-                            },
-                            4000,
-                            Ci.nsITimer.TYPE_ONE_SHOT
-                          );
-                        } catch {
-                          try { Services.ww.unregisterNotification(observer); } catch {}
-                        }
-                      },
-                      { once: true }
-                    );
-                  },
-                };
-
-                Services.ww.registerNotification(observer);
-                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                return { success: true, message: "Draft window opened, save triggered, will close automatically" };
+                return { success: true, message: "Draft appended to IMAP Drafts (backend copy)", draftsFolder: draftsURI };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -984,7 +991,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml) {
+            async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
                 if (!folder) {
@@ -1055,78 +1062,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.identity = identity;
                 }
 
-                // Same approach as saveDraft(): briefly open compose window, save draft, close.
-                const observer = {
-                  observe(subject, topic) {
-                    if (topic !== "domwindowopened") return;
-                    const win = subject;
-                    win.addEventListener(
-                      "load",
-                      () => {
-                        try {
-                          const url = String(win.location);
-                          if (!url.includes("messengercompose")) return;
+                // Save reply draft by appending an RFC822 message directly into the identity's Drafts folder.
+                const rfc822 = _makeRfc822Draft({
+                  from: _formatFrom(identity),
+                  to: composeFields.to || "",
+                  cc: composeFields.cc || "",
+                  subject: composeFields.subject || "",
+                  body: body || "",
+                  inReplyTo: msgHdr.messageId,
+                  references: composeFields.references || "",
+                });
 
-                          const t1 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                          t1.init(
-                            {
-                              notify: () => {
-                                let saved = false;
-                                try {
-                                  if (typeof win.goDoCommand === "function") {
-                                    win.goDoCommand("cmd_saveAsDraft");
-                                    saved = true;
-                                  }
-                                } catch {}
+                const draftsURI = _getDraftsFolderURIForIdentity(identity);
+                if (!draftsURI) {
+                  return { error: "Could not determine Drafts folder URI for identity" };
+                }
 
-                                if (!saved) {
-                                  try {
-                                    const cmd = win.document && win.document.getElementById && win.document.getElementById("cmd_saveAsDraft");
-                                    if (cmd && typeof cmd.doCommand === "function") {
-                                      cmd.doCommand();
-                                      saved = true;
-                                    }
-                                  } catch {}
-                                }
+                const draftsFolder = MailServices.folderLookup.getFolderForURL(draftsURI);
+                if (!draftsFolder) {
+                  return { error: `Drafts folder not found: ${draftsURI}` };
+                }
 
-                                if (!saved) {
-                                  try {
-                                    if (typeof win.SaveAsDraft === "function") {
-                                      win.SaveAsDraft();
-                                      saved = true;
-                                    }
-                                  } catch {}
-                                }
+                const file = _writeStringToTempFileUtf8("tb-mcp-reply-draft", rfc822);
+                await _copyFileToFolderAsDraft(file, draftsFolder);
+                try { draftsFolder.updateFolder(null); } catch {}
 
-                                const t2 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                t2.init(
-                                  {
-                                    notify: () => {
-                                      try { win.close(); } catch {}
-                                      try { Services.ww.unregisterNotification(observer); } catch {}
-                                    },
-                                  },
-                                  12000,
-                                  Ci.nsITimer.TYPE_ONE_SHOT
-                                );
-                              },
-                            },
-                            4000,
-                            Ci.nsITimer.TYPE_ONE_SHOT
-                          );
-                        } catch {
-                          try { Services.ww.unregisterNotification(observer); } catch {}
-                        }
-                      },
-                      { once: true }
-                    );
-                  },
-                };
-
-                Services.ww.registerNotification(observer);
-                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                return { success: true, message: "Draft window opened, save triggered, will close automatically", messageId, folderPath };
+                return { success: true, message: "Reply draft appended to IMAP Drafts (backend copy)", messageId, folderPath, draftsFolder: draftsURI };
               } catch (e) {
                 return { error: e.toString() };
               }
