@@ -939,6 +939,37 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             const _pendingSendListeners = new Set();
 
+            function _setClipboardText(text) {
+              try {
+                const clipboard = Cc["@mozilla.org/widget/clipboard;1"].getService(Ci.nsIClipboard);
+                const trans = Cc["@mozilla.org/widget/transferable;1"].createInstance(Ci.nsITransferable);
+                trans.init(null);
+                trans.addDataFlavor("text/unicode");
+                const str = Cc["@mozilla.org/supports-string;1"].createInstance(Ci.nsISupportsString);
+                str.data = String(text || "");
+                trans.setTransferData("text/unicode", str, str.data.length * 2);
+                clipboard.setData(trans, null, Ci.nsIClipboard.kGlobalClipboard);
+                return true;
+              } catch {
+                return false;
+              }
+            }
+
+            function _sendCtrlKey(win, keyCode) {
+              try {
+                const wu = win.windowUtils || win
+                  .QueryInterface(Ci.nsIInterfaceRequestor)
+                  .getInterface(Ci.nsIDOMWindowUtils);
+                if (!wu || typeof wu.sendKeyEvent !== "function") return false;
+                const CTRL = 1; // KEYEVENT_CTRLDOWN
+                wu.sendKeyEvent("keydown", keyCode, 0, CTRL);
+                wu.sendKeyEvent("keyup", keyCode, 0, CTRL);
+                return true;
+              } catch {
+                return false;
+              }
+            }
+
             function _saveDraftViaComposeWindow({ identity, to, cc, subject, bodyHtml, timeoutMs = 45000 }) {
               // Uses Thunderbird's native Save-as-Draft via nsIMsgCompose.SendMsg,
               // so Exchange/OWA sees a real Draft ("[Draft]" + Send enabled).
@@ -1567,36 +1598,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                   return;
                                 }
 
-                                // Insert reply text.
-                                try {
-                                  const editor = (typeof win.GetCurrentEditor === "function")
-                                    ? win.GetCurrentEditor()
-                                    : (win.gMsgCompose && win.gMsgCompose.editor) || null;
-                                  const doc = editor && editor.document;
-                                  if (doc && doc.body) {
-                                    const safe = String(body || "")
-                                      .replace(/&/g, "&amp;")
-                                      .replace(/</g, "&lt;")
-                                      .replace(/>/g, "&gt;")
-                                      .replace(/\n/g, "<br>");
-                                    doc.body.insertAdjacentHTML("afterbegin", `<p>${safe}</p><p><br></p>`);
-                                  }
-                                } catch {}
+                                // Paste reply text like a human (Ctrl+V), then close like a human (Ctrl+W).
+                                try { win.focus(); } catch {}
+                                _setClipboardText(String(body || "") + "\n\n");
+                                _sendCtrlKey(win, 86); // Ctrl+V
 
-                                // Close compose to trigger prompt.
                                 schedule(600, () => {
+                                  _sendCtrlKey(win, 87); // Ctrl+W
+
+                                  // Fallback close
                                   try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
                                   try { if (!win.closed) win.close(); } catch {}
-                                  try {
-                                    const wu = win.windowUtils || win
-                                      .QueryInterface(Ci.nsIInterfaceRequestor)
-                                      .getInterface(Ci.nsIDOMWindowUtils);
-                                    if (wu && typeof wu.sendKeyEvent === "function") {
-                                      const CTRL = 1;
-                                      wu.sendKeyEvent("keydown", 87, 0, CTRL);
-                                      wu.sendKeyEvent("keyup", 87, 0, CTRL);
-                                    }
-                                  } catch {}
 
                                   try { Services.ww.unregisterNotification(composeObserver); } catch {}
 
