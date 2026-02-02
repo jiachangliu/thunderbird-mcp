@@ -1559,7 +1559,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const tab = await composeApi.beginReply(msgId, replyType);
                 const tabId = tab && tab.id;
 
-                // Locate the compose editor. In TB140, replies may open as a tab inside the 3-pane window.
                 const sleep = (ms) => new Promise((resolve2) => {
                   try {
                     const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -1569,62 +1568,64 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 });
 
+                // Prefer resolving the compose tab via the extension's TabManager (most direct path to nativeTab).
+                let composeWin = null;
+                try {
+                  const tm = context && context.extension && context.extension.tabManager;
+                  if (tm && typeof tm.get === "function") {
+                    const extTab = tm.get(tabId);
+                    if (extTab && extTab.nativeTab) {
+                      composeWin = extTab.nativeTab;
+                    }
+                  }
+                } catch {}
+
+                // Fallback: scan mail:3pane windows for a compose tab.
                 function findComposeContentWindow() {
-                  // Prefer any mail:3pane window with a messageCompose tab.
                   try {
                     const en = Services.wm.getEnumerator("mail:3pane");
                     while (en.hasMoreElements()) {
                       const w = en.getNext();
-                      try {
-                        const tabmail = w.document && w.document.getElementById && w.document.getElementById("tabmail");
-                        if (!tabmail || !tabmail.tabInfo) continue;
-                        for (const ti of tabmail.tabInfo) {
-                          try {
-                            const modeName = ti.mode && (ti.mode.name || ti.mode.type || ti.mode);
-                            const isCompose = String(modeName || "").toLowerCase().includes("compose");
-                            const browser = ti.browser || ti.linkedBrowser;
-                            const cw = browser && browser.contentWindow;
-                            if (isCompose && cw && cw.gMsgCompose) {
-                              return { w, tabmail, ti, cw };
-                            }
-                            // Sometimes modeName isn't set; fall back to URL.
-                            const href = cw && cw.location && cw.location.href;
-                            if (href && String(href).includes("messengercompose") && cw.gMsgCompose) {
-                              return { w, tabmail, ti, cw };
-                            }
-                          } catch {}
+                      const tabmail = w.document && w.document.getElementById && w.document.getElementById("tabmail");
+                      if (!tabmail || !tabmail.tabInfo) continue;
+                      for (const ti of tabmail.tabInfo) {
+                        const browser = ti.browser || ti.linkedBrowser;
+                        const cw = browser && browser.contentWindow;
+                        if (!cw) continue;
+                        const href = cw.location && cw.location.href;
+                        if (href && String(href).includes("messengercompose") && cw.gMsgCompose) {
+                          return { w, tabmail, ti, cw };
                         }
-                      } catch {}
+                      }
                     }
                   } catch {}
                   return null;
                 }
 
                 let found = null;
-                for (let i = 0; i < 40; i++) {
+                for (let i = 0; i < 60; i++) {
+                  if (composeWin && composeWin.gMsgCompose) {
+                    found = { cw: composeWin, tabmail: null, ti: null };
+                    break;
+                  }
                   found = findComposeContentWindow();
                   if (found) break;
                   await sleep(250);
                 }
-                if (!found) {
-                  return { error: "Timeout locating compose tab/editor (TB140 may not expose it as a window)" };
+                if (!found || !found.cw) {
+                  return { error: "Timeout locating compose editor" };
                 }
 
+                // Insert + save.
                 const inserted = _insertTextAtTopOfCompose(found.cw, plainTextBody);
+                try { if (typeof found.cw.goDoCommand === "function") found.cw.goDoCommand("cmd_saveAsDraft"); } catch {}
 
-                // Save draft using the compose window command.
-                try {
-                  if (typeof found.cw.goDoCommand === "function") {
-                    found.cw.goDoCommand("cmd_saveAsDraft");
-                  }
-                } catch {}
-
-                await sleep(1500);
+                // Let save finish.
+                await sleep(2500);
 
                 if (closeAfterSave) {
                   try {
-                    // Close the compose tab.
-                    if (found.tabmail && typeof found.tabmail.closeTab === "function") {
+                    if (found.tabmail && typeof found.tabmail.closeTab === "function" && found.ti) {
                       found.tabmail.closeTab(found.ti);
                     } else if (tabsApi && typeof tabsApi.remove === "function") {
                       await tabsApi.remove(tabId);
