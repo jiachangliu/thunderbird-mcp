@@ -1825,6 +1825,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   messageManagerKeys: (context && context.messageManager) ? Object.getOwnPropertyNames(context.messageManager).slice(0,80) : [],
                   messageManagerProxyType: (context && context.messageManagerProxy) ? Object.prototype.toString.call(context.messageManagerProxy) : null,
                   messageManagerProxyKeys: (context && context.messageManagerProxy) ? Object.getOwnPropertyNames(context.messageManagerProxy).slice(0,80) : [],
+                  mmFromProxyType: (context && context.messageManagerProxy && context.messageManagerProxy.messageManager) ? Object.prototype.toString.call(context.messageManagerProxy.messageManager) : null,
+                  mmFromProxyKeys: (context && context.messageManagerProxy && context.messageManagerProxy.messageManager) ? Object.getOwnPropertyNames(context.messageManagerProxy.messageManager).slice(0,80) : [],
                   hasExtension: !!(context && context.extension),
                   extensionKeys: context && context.extension ? Object.getOwnPropertyNames(context.extension) : [],
                   hasApiManager: !!(context && context.extension && context.extension.apiManager),
