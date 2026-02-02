@@ -208,6 +208,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["folderPath", "messageIds"],
         },
       },
+      {
+        name: "getRawMessage",
+        title: "Get Raw Message Source",
+        description: "Fetch raw RFC822 source (headers+body) for a message. Useful for comparing Draft formatting.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "Message-ID" },
+            folderPath: { type: "string", description: "Folder URI" }
+          },
+          required: ["messageId", "folderPath"]
+        }
+      },
     ];
 
     return {
@@ -1374,6 +1387,70 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function getRawMessage(messageId, folderPath) {
+              return new Promise((resolve) => {
+                try {
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) {
+                    resolve({ error: `Folder not found: ${folderPath}` });
+                    return;
+                  }
+
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    resolve({ error: "Could not access folder database" });
+                    return;
+                  }
+
+                  let msgHdr = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (hdr.messageId === messageId) {
+                      msgHdr = hdr;
+                      break;
+                    }
+                  }
+
+                  if (!msgHdr) {
+                    resolve({ error: `Message not found: ${messageId}` });
+                    return;
+                  }
+
+                  const msgService = MailServices.messageServiceFromURI(msgHdr.folder.getUriForMsg(msgHdr));
+                  const uri = msgHdr.folder.getUriForMsg(msgHdr);
+
+                  let chunks = [];
+                  const listener = {
+                    QueryInterface: ChromeUtils.generateQI([Ci.nsIStreamListener, Ci.nsIRequestObserver]),
+                    onStartRequest() {},
+                    onDataAvailable(request, inputStream, offset, count) {
+                      try {
+                        const sis = Cc["@mozilla.org/scriptableinputstream;1"].createInstance(Ci.nsIScriptableInputStream);
+                        sis.init(inputStream);
+                        chunks.push(sis.read(count));
+                      } catch (e) {
+                        // ignore
+                      }
+                    },
+                    onStopRequest(request, status) {
+                      try {
+                        if (status && !Components.isSuccessCode(status)) {
+                          resolve({ error: `streamMessage failed: ${status}` });
+                          return;
+                        }
+                        resolve({ ok: true, messageId, folderPath, source: sanitizeForJson(chunks.join("")) });
+                      } catch (e) {
+                        resolve({ error: e.toString() });
+                      }
+                    },
+                  };
+
+                  msgService.streamMessage(uri, listener, null, null, false, "", false);
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "searchMessages":
@@ -1402,6 +1479,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":
                   return deleteMessages(args.folderPath, args.messageIds);
+                case "getRawMessage":
+                  return await getRawMessage(args.messageId, args.folderPath);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
