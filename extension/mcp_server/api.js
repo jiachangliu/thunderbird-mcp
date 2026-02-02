@@ -1884,6 +1884,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 }
                 info.probes = probes;
+
+                // Try to see if context.apiCan can resolve WebExtension APIs.
+                try {
+                  info.hasApiCan = !!context.apiCan;
+                  info.apiCanKeys = context.apiCan ? Object.getOwnPropertyNames(context.apiCan).slice(0,50) : [];
+                  if (context.apiCan && typeof context.apiCan.findAPIPath === "function") {
+                    // This may return an object for known namespaces.
+                    info.apiCanComposeType = typeof context.apiCan.findAPIPath("compose");
+                    info.apiCanMessagesType = typeof context.apiCan.findAPIPath("messages");
+                  }
+                } catch (e) {
+                  info.apiCanError = String(e);
+                }
+
                 return { ok: true, info };
               } catch (e) {
                 return { error: e.toString() };
