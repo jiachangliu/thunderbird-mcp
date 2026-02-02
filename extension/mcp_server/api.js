@@ -352,10 +352,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     return {
       mcpServer: {
         start: async function() {
+          // Guard against multiple concurrent start attempts (can happen on TB reloads / multiple entrypoints).
+          // If we try to bind twice, we get NS_ERROR_SOCKET_ADDRESS_IN_USE and the caller may hang.
           try {
-            const { HttpServer } = ChromeUtils.importESModule(
-              "resource://thunderbird-mcp/httpd.sys.mjs?" + Date.now()
-            );
+            if (globalThis.__tbMcpStartPromise) {
+              return await globalThis.__tbMcpStartPromise;
+            }
+          } catch {}
+
+          globalThis.__tbMcpStartPromise = (async () => {
+            try {
+              const { HttpServer } = ChromeUtils.importESModule(
+                "resource://thunderbird-mcp/httpd.sys.mjs?" + Date.now()
+              );
             const { NetUtil } = ChromeUtils.importESModule(
               "resource://gre/modules/NetUtil.sys.mjs"
             );
@@ -3072,12 +3081,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               })();
             });
 
-            server.start(MCP_PORT);
-            console.log(`Thunderbird MCP server listening on port ${MCP_PORT}`);
-            return { success: true, port: MCP_PORT };
-          } catch (e) {
-            console.error("Failed to start MCP server:", e);
-            return { success: false, error: e.toString() };
+              server.start(MCP_PORT);
+              console.log(`Thunderbird MCP server listening on port ${MCP_PORT}`);
+              return { success: true, port: MCP_PORT };
+            } catch (e) {
+              console.error("Failed to start MCP server:", e);
+              return { success: false, error: e.toString() };
+            }
+          })();
+
+          try {
+            const result = await globalThis.__tbMcpStartPromise;
+            return result;
+          } finally {
+            // Keep the promise so future calls return immediately.
           }
         }
       }
