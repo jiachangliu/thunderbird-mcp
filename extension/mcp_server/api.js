@@ -1841,6 +1841,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   "context.extension.views",
                 ];
 
+                // Inspect extension.views (Set of ExtensionView instances)
+                try {
+                  const views = (context && context.extension) ? context.extension.views : null;
+                  if (views && typeof views[Symbol.iterator] === "function") {
+                    const arr = [];
+                    let i = 0;
+                    for (const v of views) {
+                      if (i++ >= 8) break;
+                      arr.push({
+                        viewType: v && v.viewType,
+                        hasXulBrowser: !!(v && v.xulBrowser),
+                        hasContentWindow: !!(v && v.xulBrowser && v.xulBrowser.contentWindow),
+                        contentWindowHasBrowser: !!(v && v.xulBrowser && v.xulBrowser.contentWindow && v.xulBrowser.contentWindow.browser),
+                        contentWindowKeys: (v && v.xulBrowser && v.xulBrowser.contentWindow) ? Object.getOwnPropertyNames(v.xulBrowser.contentWindow).slice(0, 20) : [],
+                      });
+                    }
+                    info.viewsSample = arr;
+                  }
+                } catch (e) {
+                  info.viewsSampleError = String(e);
+                }
+
                 for (const p of paths) {
                   try {
                     let v;
