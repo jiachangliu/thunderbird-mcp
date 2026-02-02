@@ -731,10 +731,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return tmp;
             }
 
-            function _copyFileToFolderAsDraft(file, folder) {
+            const _pendingCopyListeners = new Set();
+
+            function _copyFileToFolderAsDraft(file, folder, timeoutMs = 20000) {
               return new Promise((resolve, reject) => {
                 try {
                   const copyService = MailServices.copy;
+
+                  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  let done = false;
+
+                  const finish = (err) => {
+                    if (done) return;
+                    done = true;
+                    try { timer.cancel(); } catch {}
+                    try { _pendingCopyListeners.delete(listener); } catch {}
+                    if (err) reject(err);
+                    else resolve(true);
+                  };
 
                   const listener = {
                     QueryInterface: ChromeUtils.generateQI([Ci.nsIMsgCopyServiceListener]),
@@ -745,15 +759,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     OnStopCopy(status) {
                       try {
                         if (status && !Components.isSuccessCode(status)) {
-                          reject(new Error(`Copy failed: ${status}`));
+                          finish(new Error(`Copy failed: ${status}`));
                           return;
                         }
-                        resolve(true);
+                        finish(null);
                       } catch (e) {
-                        reject(e);
+                        finish(e);
                       }
                     },
                   };
+
+                  _pendingCopyListeners.add(listener);
+
+                  timer.init(
+                    {
+                      notify: () => finish(new Error("Copy timed out (no OnStopCopy)")),
+                    },
+                    timeoutMs,
+                    Ci.nsITimer.TYPE_ONE_SHOT
+                  );
 
                   let flags = 0;
                   try {
@@ -764,21 +788,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                   const copyFn = copyService.CopyFileMessage || copyService.copyFileMessage;
                   if (typeof copyFn !== "function") {
-                    reject(new Error("Copy service missing CopyFileMessage/copyFileMessage"));
+                    finish(new Error("Copy service missing CopyFileMessage/copyFileMessage"));
                     return;
                   }
 
-                  copyFn.call(
-                    copyService,
-                    file,
-                    folder,
-                    null,
-                    false,
-                    flags,
-                    "",
-                    listener,
-                    null
-                  );
+                  copyFn.call(copyService, file, folder, null, false, flags, "", listener, null);
                 } catch (e) {
                   reject(e);
                 }
