@@ -73,7 +73,7 @@ print(f'Will delete {len(to_delete)} message(s) from Drafts.')
 for idx,mid in enumerate(to_delete, start=1):
   for attempt in range(1,4):
     try:
-      res=rpc('purgeMessages',{'folderPath':DRAFTS,'messageIds':[mid]},timeout=300)
+      res=rpc('deleteMessages',{'folderPath':DRAFTS,'messageIds':[mid]},timeout=300)
       if res.get('error'):
         raise RuntimeError(res['error'])
       print(f'Deleted {idx}/{len(to_delete)}: {mid}')
