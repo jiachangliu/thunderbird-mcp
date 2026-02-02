@@ -733,10 +733,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           t1.init(
                             {
                               notify: () => {
+                                // Try multiple ways to trigger "Save as Draft".
+                                let saved = false;
                                 try {
-                                  win.goDoCommand("cmd_saveAsDraft");
-                                } catch (e) {
-                                  // ignore
+                                  if (typeof win.goDoCommand === "function") {
+                                    win.goDoCommand("cmd_saveAsDraft");
+                                    saved = true;
+                                  }
+                                } catch {}
+
+                                if (!saved) {
+                                  try {
+                                    const cmd = win.document && win.document.getElementById && win.document.getElementById("cmd_saveAsDraft");
+                                    if (cmd && typeof cmd.doCommand === "function") {
+                                      cmd.doCommand();
+                                      saved = true;
+                                    }
+                                  } catch {}
+                                }
+
+                                if (!saved) {
+                                  try {
+                                    if (typeof win.SaveAsDraft === "function") {
+                                      win.SaveAsDraft();
+                                      saved = true;
+                                    }
+                                  } catch {}
                                 }
 
                                 // Give IMAP/Outlook time to enqueue the draft, then close.
@@ -748,12 +770,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       try { Services.ww.unregisterNotification(observer); } catch {}
                                     },
                                   },
-                                  6000,
+                                  12000,
                                   Ci.nsITimer.TYPE_ONE_SHOT
                                 );
                               },
                             },
-                            1500,
+                            4000,
                             Ci.nsITimer.TYPE_ONE_SHOT
                           );
                         } catch {
@@ -1033,10 +1055,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           t1.init(
                             {
                               notify: () => {
+                                let saved = false;
                                 try {
-                                  win.goDoCommand("cmd_saveAsDraft");
-                                } catch (e) {
-                                  // ignore
+                                  if (typeof win.goDoCommand === "function") {
+                                    win.goDoCommand("cmd_saveAsDraft");
+                                    saved = true;
+                                  }
+                                } catch {}
+
+                                if (!saved) {
+                                  try {
+                                    const cmd = win.document && win.document.getElementById && win.document.getElementById("cmd_saveAsDraft");
+                                    if (cmd && typeof cmd.doCommand === "function") {
+                                      cmd.doCommand();
+                                      saved = true;
+                                    }
+                                  } catch {}
+                                }
+
+                                if (!saved) {
+                                  try {
+                                    if (typeof win.SaveAsDraft === "function") {
+                                      win.SaveAsDraft();
+                                      saved = true;
+                                    }
+                                  } catch {}
                                 }
 
                                 const t2 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -1047,12 +1090,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       try { Services.ww.unregisterNotification(observer); } catch {}
                                     },
                                   },
-                                  6000,
+                                  12000,
                                   Ci.nsITimer.TYPE_ONE_SHOT
                                 );
                               },
                             },
-                            1500,
+                            4000,
                             Ci.nsITimer.TYPE_ONE_SHOT
                           );
                         } catch {
