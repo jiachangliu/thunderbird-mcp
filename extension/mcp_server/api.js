@@ -218,14 +218,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            messageId: { type: "string", description: "RFC822 Message-ID header (same as other tools; e.g. 4f23...@...). Will be resolved via messages.query({headerMessageId})." },
+            messageId: { type: "string", description: "RFC822 Message-ID header (same as other tools; e.g. 4f23...@...)." },
+            folderPath: { type: "string", description: "Folder URI where the message currently lives (e.g. imap://.../INBOX). Used to resolve the WebExtension numeric message id without relying on global search." },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
             plainTextBody: { type: "string", description: "Reply body as plain text to insert ABOVE the quoted original. Newlines will be preserved." },
             htmlBody: { type: "string", description: "Reply body as HTML to insert ABOVE the quoted original." },
             includeQuotedOriginal: { type: "boolean", description: "Whether to keep the quoted original at bottom (default: true)." },
             closeAfterSave: { type: "boolean", description: "Close the compose tab/window after saving (default: true)." }
           },
-          required: ["messageId"]
+          required: ["messageId", "folderPath"]
         }
       },
       {
@@ -1904,32 +1905,93 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function replyToMessageDraftComposeApi(messageIdHeader, replyAll, plainTextBody, htmlBody, includeQuotedOriginal = true, closeAfterSave = true) {
+            async function replyToMessageDraftComposeApi(messageIdHeader, folderPath, replyAll, plainTextBody, htmlBody, includeQuotedOriginal = true, closeAfterSave = true) {
               try {
                 // Prefer using context.apiCan to access WebExtension namespaces from the experiment context.
                 if (!context || !context.apiCan || typeof context.apiCan.findAPIPath !== "function") {
                   return { error: "WebExtension API container (context.apiCan) is not available" };
                 }
 
+                const accountsApi = context.apiCan.findAPIPath("accounts");
                 const messagesApi = context.apiCan.findAPIPath("messages");
                 const composeApi = context.apiCan.findAPIPath("compose");
                 const tabsApi = context.apiCan.findAPIPath("tabs");
 
-                if (!messagesApi || !composeApi) {
-                  return { error: "Could not resolve messages/compose API via context.apiCan" };
+                if (!accountsApi || !messagesApi || !composeApi) {
+                  return { error: "Could not resolve accounts/messages/compose API via context.apiCan" };
                 }
 
-                // Resolve the WebExtension numeric messageId from a RFC822 Message-ID header.
-                // Workaround: some Thunderbird builds throw if fromDate is undefined.
-                const queryInfo = { headerMessageId: messageIdHeader, fromDate: new Date(0), toDate: new Date() };
-                const queryRes = await messagesApi.query(queryInfo);
-                const messages = (queryRes && Array.isArray(queryRes.messages)) ? queryRes.messages : [];
-                if (messages.length === 0) {
-                  return { error: `messages.query() returned no results for headerMessageId=${messageIdHeader}` };
+                // Resolve a WebExtension folder id from the IMAP folder URI.
+                function parseFolderUri(uri) {
+                  // Example: imap://jl4624%40cornell.edu@outlook.office365.com/INBOX
+                  const m = String(uri || "").match(/^imap:\/\/(.+?)@([^\/]+)\/(.+)$/i);
+                  if (!m) return null;
+                  const userEnc = m[1];
+                  const host = m[2];
+                  const path = m[3];
+                  const user = decodeURIComponent(userEnc);
+                  const folderPathPart = "/" + path.replace(/^\/+/, "");
+                  return { user, host, folderPathPart };
                 }
 
-                const msg = messages[0];
-                const msgId = msg.id;
+                function findFolderByPath(folders, wantedPath) {
+                  if (!Array.isArray(folders)) return null;
+                  for (const f of folders) {
+                    if (!f) continue;
+                    if (f.path === wantedPath) return f;
+                    const sub = findFolderByPath(f.subFolders || f.folders || f.subfolders, wantedPath);
+                    if (sub) return sub;
+                  }
+                  return null;
+                }
+
+                const parsed = parseFolderUri(folderPath);
+                if (!parsed) {
+                  return { error: `Could not parse folderPath URI: ${folderPath}` };
+                }
+
+                const accounts = await accountsApi.list();
+                let folderId = null;
+                for (const acct of accounts || []) {
+                  // Prefer matching identity email to URI user.
+                  const ids = acct.identities || [];
+                  const match = ids.find(i => i && typeof i.email === "string" && i.email.toLowerCase() === parsed.user.toLowerCase());
+                  if (!match) continue;
+                  const f = findFolderByPath(acct.folders, parsed.folderPathPart);
+                  if (f && f.id) { folderId = f.id; break; }
+                }
+                if (!folderId) {
+                  return { error: `Could not resolve folderId for ${folderPath} (wanted path ${parsed.folderPathPart})` };
+                }
+
+                // Now search within that folder for the message with matching headerMessageId.
+                const listRes = await messagesApi.list(folderId);
+                let msgId = null;
+                let messageListId = listRes && listRes.id;
+                let chunk = listRes;
+                let safety = 0;
+                while (chunk && safety++ < 50) {
+                  const msgs = chunk.messages || [];
+                  for (const m of msgs) {
+                    if (m && m.headerMessageId === messageIdHeader) {
+                      msgId = m.id;
+                      break;
+                    }
+                  }
+                  if (msgId) break;
+                  if (!chunk.id || !chunk.messages || chunk.messages.length === 0) break;
+                  // Continue if there may be more.
+                  try {
+                    chunk = await messagesApi.continueList(chunk.id);
+                  } catch {
+                    break;
+                  }
+                }
+                try { if (messageListId) await messagesApi.abortList(messageListId); } catch {}
+
+                if (!msgId) {
+                  return { error: `Could not find message in folder via messages.list/continueList for headerMessageId=${messageIdHeader}` };
+                }
 
                 const replyType = replyAll ? "replyToAll" : "replyToSender";
                 const tab = await composeApi.beginReply(msgId, replyType);
@@ -2218,7 +2280,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "replyToMessageDraft":
                   return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal, args.useClosePromptSave);
                 case "replyToMessageDraftComposeApi":
-                  return await replyToMessageDraftComposeApi(args.messageId, args.replyAll, args.plainTextBody, args.htmlBody, args.includeQuotedOriginal, args.closeAfterSave);
+                  return await replyToMessageDraftComposeApi(args.messageId, args.folderPath, args.replyAll, args.plainTextBody, args.htmlBody, args.includeQuotedOriginal, args.closeAfterSave);
                 case "debugContext":
                   return debugContext();
                 case "listLatestMessages":
