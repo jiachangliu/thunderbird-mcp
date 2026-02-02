@@ -63,6 +63,12 @@ When implementing new capabilities, **prefer Thunderbird's native WebExtension A
 
 This documentation is the canonical reference for what extensions can do in a stable, supported way.
 
+When the WebExtension docs are insufficient (or behavior differs across Thunderbird versions), you can also consult the Thunderbird source code:
+
+- <https://hg-edge.mozilla.org>
+
+In practice, the combination of the **WebExtension API docs** + **Thunderbird source** is usually enough to debug most extension/MCP integration issues.
+
 Examples of high-leverage native APIs:
 - `browser.messages.*` – list/search/read messages, attachments, move/copy/delete (with the right permissions)
 - `browser.compose.*` – beginReply/beginNew, setComposeDetails, saveMessage (draft), sendMessage
