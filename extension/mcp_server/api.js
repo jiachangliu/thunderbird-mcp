@@ -1477,6 +1477,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
                   const cf = Cc["@mozilla.org/messengercompose/composefields;1"].createInstance(Ci.nsIMsgCompFields);
 
+                  // Pre-fill body BEFORE opening so the compose window starts with our text.
+                  // Thunderbird should still generate the quoted original below (like manual replies).
+                  try {
+                    const safe = String(body || "")
+                      .replace(/&/g, "&amp;")
+                      .replace(/</g, "&lt;")
+                      .replace(/>/g, "&gt;")
+                      .replace(/\n/g, "<br>");
+                    cf.body = `<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=UTF-8\"></head><body><p>${safe}</p><p><br></p></body></html>`;
+                  } catch {}
+
                   // Let Thunderbird generate recipients/quote by using Reply/ReplyAll.
                   msgComposeParams.type = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
                   msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
@@ -1500,7 +1511,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             // Insert reply text at top.
                             const runnable = {
                               run: () => {
-                                // Wait until Thunderbird has generated the quote/headers, then insert our reply text at top.
+                                // Wait until Thunderbird has generated the quote/headers.
                                 const poll = {
                                   tries: 0,
                                   run: () => {
@@ -1518,23 +1529,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       return;
                                     }
 
-                                    try {
-                                      const editor = (typeof win.GetCurrentEditor === "function")
-                                        ? win.GetCurrentEditor()
-                                        : (win.gMsgCompose && win.gMsgCompose.editor) || null;
-
-                                      if (editor) {
-                                        try { editor.beginningOfDocument(); } catch {}
-                                        try {
-                                          // Use insertText; it is most reliable across compose editors.
-                                          if (typeof editor.insertText === "function") {
-                                            editor.insertText(String(body || "") + "\n\n");
-                                          }
-                                        } catch {}
-                                      }
-                                    } catch {}
-
-                                    // Close shortly AFTER insertion.
+                                    // Close compose window -> triggers "Save draft?" prompt -> our dialogObserver clicks Save.
                                     const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                     _pendingTimers.add(tClose);
                                     tClose.init(
@@ -1565,7 +1560,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                           try { _pendingTimers.delete(tClose); } catch {}
                                         },
                                       },
-                                      1000,
+                                      500,
                                       Ci.nsITimer.TYPE_ONE_SHOT
                                     );
                                   },
