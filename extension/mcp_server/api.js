@@ -2125,7 +2125,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 }
 
-                const detailsAfterSet = await composeApi.getComposeDetails(tabId);
+                // Verify the prefix is present in the compose window before saving.
+                let detailsAfterSet = await composeApi.getComposeDetails(tabId);
+                for (let i = 0; i < 10; i++) {
+                  const b = (detailsAfterSet && typeof detailsAfterSet.body === "string") ? detailsAfterSet.body : "";
+                  const pb = (detailsAfterSet && typeof detailsAfterSet.plainTextBody === "string") ? detailsAfterSet.plainTextBody : "";
+                  const want = (plainPrefix || htmlPrefix || "").trim();
+                  const ok = want ? (pb.includes(want.split("\n")[0]) || b.includes(want.split("\n")[0]) || b.includes(htmlPrefix.slice(0, 10))) : true;
+                  if (ok) break;
+                  // Re-apply once more if not present.
+                  if (plainPrefix) {
+                    const newPlain = includeQuotedOriginal ? (plainPrefix + "\n\n" + pb) : plainPrefix;
+                    await composeApi.setComposeDetails(tabId, { plainTextBody: newPlain });
+                  } else if (htmlPrefix) {
+                    const newBody = includeQuotedOriginal ? (htmlPrefix + b) : htmlPrefix;
+                    await composeApi.setComposeDetails(tabId, { body: newBody });
+                  }
+                  await new Promise(r => Services.tm.dispatchToMainThread(() => r()));
+                  detailsAfterSet = await composeApi.getComposeDetails(tabId);
+                }
+
+                // Give the composer a beat to flush changes before saving.
+                await new Promise(r => Services.tm.dispatchToMainThread(() => r()));
 
                 await composeApi.saveMessage(tabId, { mode: "draft" });
 
