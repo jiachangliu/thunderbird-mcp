@@ -1575,10 +1575,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                   tClose.init(
                                     {
                                       notify: () => {
+                                        // Strong close sequence: cmd_close -> win.close() -> Ctrl+W
                                         try {
-                                            if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close");
-                                            else win.close();
-                                          } catch {}
+                                          if (typeof win.goDoCommand === "function") {
+                                            win.goDoCommand("cmd_close");
+                                          }
+                                        } catch {}
+
+                                        try {
+                                          // In case cmd_close didn't actually close.
+                                          if (!win.closed) {
+                                            win.close();
+                                          }
+                                        } catch {}
+
+                                        // Last resort: synthesize Ctrl+W
+                                        try {
+                                          const wu = win.windowUtils || win
+                                            .QueryInterface(Ci.nsIInterfaceRequestor)
+                                            .getInterface(Ci.nsIDOMWindowUtils);
+                                          if (wu && typeof wu.sendKeyEvent === "function") {
+                                            const CTRL = 1; // KEYEVENT_CTRLDOWN
+                                            wu.sendKeyEvent("keydown", 87, 0, CTRL);
+                                            wu.sendKeyEvent("keyup", 87, 0, CTRL);
+                                          }
+                                        } catch {}
 
                                           try { Services.ww.unregisterNotification(composeObserver); } catch {}
 
