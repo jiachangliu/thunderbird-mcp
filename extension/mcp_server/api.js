@@ -2043,7 +2043,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let messageListId = listRes && listRes.id;
                 let chunk = listRes;
                 let safety = 0;
-                while (chunk && safety++ < 50) {
+                while (chunk && safety++ < 500) {
                   const msgs = chunk.messages || [];
                   for (const m of msgs) {
                     if (m && m.headerMessageId === messageIdHeader) {
