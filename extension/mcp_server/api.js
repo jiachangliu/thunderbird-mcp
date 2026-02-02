@@ -1416,13 +1416,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             // Common dialog window for confirm-save.
                             if (!url.includes("commonDialog")) return;
 
-                            // Auto-accept (equivalent to clicking "Save").
+                            // Choose the button whose label contains "Save".
                             try {
-                              win.document.documentElement.acceptDialog();
+                              const dlg = win.document.querySelector("dialog");
+                              const tryButtons = ["accept", "extra1", "extra2", "cancel"];
+                              let clicked = false;
+                              if (dlg && typeof dlg.getButton === "function") {
+                                for (const which of tryButtons) {
+                                  const btn = dlg.getButton(which);
+                                  const label = btn ? (btn.getAttribute("label") || btn.label || "") : "";
+                                  if (btn && /save/i.test(label)) {
+                                    btn.click();
+                                    clicked = true;
+                                    break;
+                                  }
+                                }
+                              }
+                              if (!clicked) {
+                                // Fallback to acceptDialog (may be Save depending on dialog wiring).
+                                win.document.documentElement.acceptDialog();
+                              }
                             } catch {
-                              try {
-                                if (typeof win.acceptDialog === "function") win.acceptDialog();
-                              } catch {}
+                              try { win.document.documentElement.acceptDialog(); } catch {}
                             }
                           } catch {}
                         },
@@ -1475,9 +1490,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 } catch {}
 
                                 try { Services.ww.unregisterNotification(composeObserver); } catch {}
-                                // Keep dialog observer around briefly; it will fire on the prompt.
-                                const cleanup = { run: () => { try { Services.ww.unregisterNotification(dialogObserver); } catch {} try { _pendingDraftMessageIds.delete(draftMessageId); } catch {} } };
-                                Services.tm.dispatchToMainThread(cleanup);
+
+                                // Keep dialog observer around for a bit so it can catch the prompt.
+                                const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                _pendingTimers.add(t);
+                                t.init(
+                                  {
+                                    notify: () => {
+                                      try { Services.ww.unregisterNotification(dialogObserver); } catch {}
+                                      try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
+                                      try { _pendingTimers.delete(t); } catch {}
+                                    },
+                                  },
+                                  15000,
+                                  Ci.nsITimer.TYPE_ONE_SHOT
+                                );
                               },
                             };
                             Services.tm.dispatchToMainThread(runnable);
