@@ -922,9 +922,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function _saveDraftViaComposeWindow({ identity, to, cc, subject, bodyHtml }) {
+            function _saveDraftViaComposeWindow({ identity, to, cc, subject, bodyHtml, timeoutMs = 30000 }) {
               // Uses Thunderbird's native Save-as-Draft via nsIMsgCompose.SendMsg,
-              // which should set the correct server-side draft/unsent flags for Outlook Web.
+              // to set correct server-side draft/unsent flags for Outlook Web.
               return new Promise((resolve) => {
                 try {
                   const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
@@ -942,6 +942,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.composeFields = composeFields;
                   if (identity) msgComposeParams.identity = identity;
 
+                  let finished = false;
+                  const finish = (ok, reason) => {
+                    if (finished) return;
+                    finished = true;
+                    try { Services.ww.unregisterNotification(observer); } catch {}
+                    resolve({ ok: !!ok, reason: reason || "" });
+                  };
+
+                  // Timeout guard
+                  const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  t.init({ notify: () => finish(false, "timeout") }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+
                   const observer = {
                     observe(subjectWin, topic) {
                       if (topic !== "domwindowopened") return;
@@ -953,7 +965,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             const url = String(win.location);
                             if (!url.includes("messengercompose")) return;
 
-                            // Give the editor a moment to initialize, then save draft.
                             const runnable = {
                               run: () => {
                                 try {
@@ -964,15 +975,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                   }
                                 } catch {}
 
-                                // Close after another moment.
-                                const closeRun = { run: () => { try { win.close(); } catch {} try { Services.ww.unregisterNotification(observer); } catch {} resolve({ ok: true }); } };
+                                // Close window after a short delay to let save complete.
+                                const closeRun = {
+                                  run: () => {
+                                    try { win.close(); } catch {}
+                                    try { t.cancel(); } catch {}
+                                    finish(true, "saved");
+                                  },
+                                };
                                 Services.tm.dispatchToMainThread(closeRun);
                               },
                             };
                             Services.tm.dispatchToMainThread(runnable);
                           } catch {
-                            try { Services.ww.unregisterNotification(observer); } catch {}
-                            resolve({ ok: false });
+                            try { t.cancel(); } catch {}
+                            finish(false, "exception");
                           }
                         },
                         { once: true }
@@ -983,7 +1000,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   Services.ww.registerNotification(observer);
                   msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
                 } catch {
-                  resolve({ ok: false });
+                  resolve({ ok: false, reason: "exception" });
                 }
               });
             }
