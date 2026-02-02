@@ -1920,7 +1920,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // Resolve the WebExtension numeric messageId from a RFC822 Message-ID header.
-                const queryInfo = { headerMessageId: messageIdHeader };
+                // Workaround: some Thunderbird builds throw if fromDate is undefined.
+                const queryInfo = { headerMessageId: messageIdHeader, fromDate: new Date(0), toDate: new Date() };
                 const queryRes = await messagesApi.query(queryInfo);
                 const messages = (queryRes && Array.isArray(queryRes.messages)) ? queryRes.messages : [];
                 if (messages.length === 0) {
