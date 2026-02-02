@@ -1090,7 +1090,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 const origSubject = msgHdr.subject || "";
-                composeFields.subject = origSubject.startsWith("Re:") ? origSubject : `Re: ${origSubject}`;
+                composeFields.subject = /^\s*re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
 
                 // References header enables proper email threading
                 composeFields.references = `<${messageId}>`;
@@ -1169,7 +1169,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 const origSubject = msgHdr.subject || "";
-                composeFields.subject = origSubject.startsWith("Re:") ? origSubject : `Re: ${origSubject}`;
+                composeFields.subject = /^\s*re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
                 composeFields.references = `<${messageId}>`;
 
                 if (isHtml) {
