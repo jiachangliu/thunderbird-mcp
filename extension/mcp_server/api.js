@@ -1630,11 +1630,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // Keep timers strongly referenced; otherwise they can be GC'd before firing.
+            const _activeTimers = new Set();
             function _sleep(ms) {
               return new Promise((resolve) => {
                 try {
                   const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                  t.initWithCallback({ notify: () => resolve() }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+                  _activeTimers.add(t);
+                  t.initWithCallback({
+                    notify: () => {
+                      try { _activeTimers.delete(t); } catch {}
+                      resolve();
+                    }
+                  }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
                 } catch {
                   Services.tm.dispatchToMainThread({ run: () => resolve() });
                 }
