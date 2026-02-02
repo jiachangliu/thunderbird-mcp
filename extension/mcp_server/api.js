@@ -1704,11 +1704,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (replyAll) {
                   composeFields.to = msgHdr.author;
-                  const otherRecipients = (msgHdr.recipients || "").split(",")
+
+                  // Combine original recipients and CC list, filter out own address.
+                  const allRecipients = [
+                    ...(msgHdr.recipients || "").split(","),
+                    ...(msgHdr.ccList || "").split(",")
+                  ]
                     .map(r => r.trim())
                     .filter(r => r && !r.includes(folder.server.username));
-                  if (otherRecipients.length > 0) {
-                    composeFields.cc = otherRecipients.join(", ");
+
+                  // Deduplicate by email address.
+                  const seen = new Set();
+                  const uniqueRecipients = allRecipients.filter(r => {
+                    const email = r.match(/<([^>]+)>/)?.[1]?.toLowerCase() || r.toLowerCase();
+                    if (seen.has(email)) return false;
+                    seen.add(email);
+                    return true;
+                  });
+
+                  if (uniqueRecipients.length > 0) {
+                    composeFields.cc = uniqueRecipients.join(", ");
                   }
                 } else {
                   composeFields.to = msgHdr.author;
