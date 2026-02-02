@@ -922,9 +922,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function _saveDraftViaComposeWindow({ identity, to, cc, subject, bodyHtml, timeoutMs = 30000 }) {
+            const _pendingSendListeners = new Set();
+
+            function _saveDraftViaComposeWindow({ identity, to, cc, subject, bodyHtml, timeoutMs = 45000 }) {
               // Uses Thunderbird's native Save-as-Draft via nsIMsgCompose.SendMsg,
-              // to set correct server-side draft/unsent flags for Outlook Web.
+              // so Exchange/OWA sees a real Draft ("[Draft]" + Send enabled).
               return new Promise((resolve) => {
                 try {
                   const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
@@ -943,16 +945,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (identity) msgComposeParams.identity = identity;
 
                   let finished = false;
-                  const finish = (ok, reason) => {
+                  const finish = (ok, reason, details) => {
                     if (finished) return;
                     finished = true;
+                    try { timer.cancel(); } catch {}
                     try { Services.ww.unregisterNotification(observer); } catch {}
-                    resolve({ ok: !!ok, reason: reason || "" });
+                    resolve({ ok: !!ok, reason: reason || "", ...(details || {}) });
                   };
 
-                  // Timeout guard
-                  const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                  t.init({ notify: () => finish(false, "timeout") }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timer.init({ notify: () => finish(false, "timeout") }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
 
                   const observer = {
                     observe(subjectWin, topic) {
@@ -965,31 +967,65 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             const url = String(win.location);
                             if (!url.includes("messengercompose")) return;
 
+                            // Delay one tick so the editor is really ready.
                             const runnable = {
                               run: () => {
                                 try {
                                   const comp = msgComposeService.GetMsgComposeForWindow(win);
-                                  const sendFn = comp && (comp.SendMsg || comp.sendMsg);
-                                  if (typeof sendFn === "function") {
-                                    sendFn.call(comp, Ci.nsIMsgSend.nsMsgSaveAsDraft, identity || null, null, null, null);
-                                  }
-                                } catch {}
-
-                                // Close window after a short delay to let save complete.
-                                const closeRun = {
-                                  run: () => {
+                                  if (!comp) {
+                                    finish(false, "no-compose-instance");
                                     try { win.close(); } catch {}
-                                    try { t.cancel(); } catch {}
-                                    finish(true, "saved");
-                                  },
-                                };
-                                Services.tm.dispatchToMainThread(closeRun);
+                                    return;
+                                  }
+
+                                  const sendFn = comp.SendMsg || comp.sendMsg;
+                                  if (typeof sendFn !== "function") {
+                                    finish(false, "no-SendMsg");
+                                    try { win.close(); } catch {}
+                                    return;
+                                  }
+
+                                  // Listen for save completion.
+                                  let gotStop = false;
+                                  const sendListener = {
+                                    QueryInterface: ChromeUtils.generateQI([Ci.nsIMsgSendListener]),
+                                    onStartSending() {},
+                                    onProgress() {},
+                                    onStatus() {},
+                                    onGetDraftFolderURI() {},
+                                    onStopSending(msgID, status, msg, returnFile) {
+                                      gotStop = true;
+                                      _pendingSendListeners.delete(sendListener);
+                                      const ok = !status || Components.isSuccessCode(status);
+                                      try { win.close(); } catch {}
+                                      finish(ok, ok ? "saved" : "send-failed", { msgID, status: String(status || "") });
+                                    },
+                                  };
+                                  _pendingSendListeners.add(sendListener);
+
+                                  // Start save.
+                                  sendFn.call(comp, Ci.nsIMsgSend.nsMsgSaveAsDraft, identity || null, null, null, sendListener);
+
+                                  // Safety: close window if we never get callback but still finish.
+                                  const closeLater = {
+                                    run: () => {
+                                      if (finished) return;
+                                      if (!gotStop) {
+                                        try { win.close(); } catch {}
+                                        finish(true, "closed-without-callback");
+                                      }
+                                    },
+                                  };
+                                  Services.tm.dispatchToMainThread(closeLater);
+                                } catch (e) {
+                                  try { win.close(); } catch {}
+                                  finish(false, "exception", { error: String(e) });
+                                }
                               },
                             };
                             Services.tm.dispatchToMainThread(runnable);
-                          } catch {
-                            try { t.cancel(); } catch {}
-                            finish(false, "exception");
+                          } catch (e) {
+                            finish(false, "exception", { error: String(e) });
                           }
                         },
                         { once: true }
@@ -999,8 +1035,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                   Services.ww.registerNotification(observer);
                   msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-                } catch {
-                  resolve({ ok: false, reason: "exception" });
+                } catch (e) {
+                  resolve({ ok: false, reason: "exception", error: String(e) });
                 }
               });
             }
