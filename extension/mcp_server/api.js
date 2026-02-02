@@ -762,7 +762,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     flags = 0;
                   }
 
-                  copyService.CopyFileMessage(
+                  const copyFn = copyService.CopyFileMessage || copyService.copyFileMessage;
+                  if (typeof copyFn !== "function") {
+                    reject(new Error("Copy service missing CopyFileMessage/copyFileMessage"));
+                    return;
+                  }
+
+                  copyFn.call(
+                    copyService,
                     file,
                     folder,
                     null,
