@@ -2070,8 +2070,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const tab = await composeApi.beginReply(msgId, replyType);
                 const tabId = tab && tab.id;
 
-                const details = await composeApi.getComposeDetails(tabId);
-                const existingBody = (details && typeof details.body === "string") ? details.body : "";
+                // Wait for Thunderbird to finish inserting the quoted original.
+                // If we set the body too early, Thunderbird may later overwrite it when the quote loads.
+                let details = null;
+                let existingBody = "";
+                for (let i = 0; i < 40; i++) {
+                  details = await composeApi.getComposeDetails(tabId);
+                  existingBody = (details && typeof details.body === "string") ? details.body : "";
+                  if (existingBody && /<blockquote[^>]*type=\"cite\"/i.test(existingBody)) {
+                    break;
+                  }
+                  // try compose state as a secondary signal
+                  try {
+                    const st = await composeApi.getComposeState(tabId);
+                    if (st && st.canSend) {
+                      // still might not include quote; keep waiting a bit
+                    }
+                  } catch {}
+                  await new Promise(r => Services.tm.dispatchToMainThread(() => r()));
+                  // small yield; repeat
+                }
 
                 let prefixHtml = "";
                 if (typeof htmlBody === "string" && htmlBody.trim()) {
@@ -2087,6 +2105,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const newBody = includeQuotedOriginal ? (prefixHtml + existingBody) : prefixHtml;
                 await composeApi.setComposeDetails(tabId, { body: newBody });
 
+                // Save after body is updated.
                 await composeApi.saveMessage(tabId, { mode: "draft" });
 
                 if (closeAfterSave && tabsApi && typeof tabsApi.remove === "function") {
