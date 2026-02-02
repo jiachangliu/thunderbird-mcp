@@ -1632,6 +1632,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            function _withTimeout(promise, timeoutMs, label) {
+              return Promise.race([
+                promise,
+                (async () => {
+                  await _sleep(timeoutMs);
+                  throw new Error(`Timeout: ${label || "operation"} (${timeoutMs}ms)`);
+                })(),
+              ]);
+            }
+
             function _snapshotComposeTabs() {
               // Returns a set of compose tab identifiers + light metadata.
               const out = [];
@@ -1736,35 +1746,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const startedAt = Date.now();
 
                 // Open the draft for editing.
-                const tab = await composeApi.beginNew(msgId);
+                const tab = await _withTimeout(composeApi.beginNew(msgId), 15000, "compose.beginNew(draft)");
                 const tabId = tab && tab.id;
+                if (!tabId) return { error: "compose.beginNew did not return a tabId" };
 
                 // Ensure identity.
                 if (desiredIdentityId) {
-                  try { await composeApi.setComposeDetails(tabId, { identityId: desiredIdentityId }); } catch {}
+                  try { await _withTimeout(composeApi.setComposeDetails(tabId, { identityId: desiredIdentityId }), 5000, "compose.setComposeDetails(identityId)"); } catch {}
                 }
 
-                // Get the compose window via TabManager.
+                // Find the compose window via TabManager, retrying a bit.
                 let cw = null;
-                try {
-                  const tm = context && context.extension && context.extension.tabManager;
-                  if (tm && typeof tm.get === "function") {
-                    const extTab = tm.get(tabId);
-                    if (extTab && extTab.nativeTab) cw = extTab.nativeTab;
-                  }
-                } catch {}
-
-                // Fallback: scan.
-                if (!cw) {
-                  const after = _snapshotComposeTabs();
-                  const picked = after && after[0];
-                  cw = picked && picked.cw;
-                }
-
-                // Wait for gMsgCompose/editor.
-                for (let i = 0; i < 60 && (!cw || !cw.gMsgCompose); i++) {
+                for (let i = 0; i < 60; i++) {
+                  try {
+                    const tm = context && context.extension && context.extension.tabManager;
+                    if (tm && typeof tm.get === "function") {
+                      const extTab = tm.get(tabId);
+                      if (extTab && extTab.nativeTab) cw = extTab.nativeTab;
+                    }
+                  } catch {}
+                  if (cw && cw.gMsgCompose) break;
                   await _sleep(250);
                 }
+
+                // Fallback: scan mail:3pane compose tabs.
+                if (!cw || !cw.gMsgCompose) {
+                  for (let i = 0; i < 60; i++) {
+                    const after = _snapshotComposeTabs();
+                    const picked = (after || []).find(x => {
+                      try { return x && x.cw && x.cw.gMsgCompose && x.cw.gMsgCompose.editor; } catch { return false; }
+                    }) || null;
+                    if (picked) { cw = picked.cw; break; }
+                    await _sleep(250);
+                  }
+                }
+
                 if (!cw || !cw.gMsgCompose) return { error: "Timeout locating compose editor for draft" };
 
                 const replaced = preserveQuotedOriginal
