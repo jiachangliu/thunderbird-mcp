@@ -236,6 +236,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: { type: "object", properties: {}, required: [] }
       },
       {
+        name: "debugMessagesList",
+        title: "Debug Messages List",
+        description: "Debug helper: resolve folderId from folderPath and list the first N messages via WebExtension messages.list (shows id + headerMessageId + subject).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string" },
+            limit: { type: "number" }
+          },
+          required: ["folderPath"]
+        }
+      },
+      {
         name: "listLatestMessages",
         title: "List Latest Messages (by folder)",
         description: "List the most recent messages in a folder WITHOUT changing any state. Useful for Drafts verification.",
@@ -1905,6 +1918,66 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            async function debugMessagesList(folderPath, limit = 20) {
+              try {
+                if (!context || !context.apiCan || typeof context.apiCan.findAPIPath !== "function") {
+                  return { error: "WebExtension API container (context.apiCan) is not available" };
+                }
+                const accountsApi = context.apiCan.findAPIPath("accounts");
+                const messagesApi = context.apiCan.findAPIPath("messages");
+                if (!accountsApi || !messagesApi) {
+                  return { error: "Could not resolve accounts/messages API via context.apiCan" };
+                }
+
+                function parseFolderUri(uri) {
+                  const m = String(uri || "").match(/^imap:\/\/(.+?)@([^\/]+)\/(.+)$/i);
+                  if (!m) return null;
+                  const user = decodeURIComponent(m[1]);
+                  const folderPathPart = "/" + m[3].replace(/^\/+/, "");
+                  return { user, folderPathPart };
+                }
+                function findFolderByPath(folders, wantedPath) {
+                  if (!Array.isArray(folders)) return null;
+                  for (const f of folders) {
+                    if (!f) continue;
+                    if (f.path === wantedPath) return f;
+                    const sub = findFolderByPath(f.subFolders || f.folders || f.subfolders, wantedPath);
+                    if (sub) return sub;
+                  }
+                  return null;
+                }
+
+                const parsed = parseFolderUri(folderPath);
+                if (!parsed) return { error: `Could not parse folderPath URI: ${folderPath}` };
+
+                const accounts = await accountsApi.list();
+                let folder = null;
+                for (const acct of accounts || []) {
+                  const match = (acct.identities || []).find(i => i && i.email && i.email.toLowerCase() === parsed.user.toLowerCase());
+                  if (!match) continue;
+                  folder = findFolderByPath(acct.folders, parsed.folderPathPart);
+                  if (folder) break;
+                }
+                if (!folder || !folder.id) {
+                  return { error: `Could not resolve folder for ${folderPath} (wanted ${parsed.folderPathPart})` };
+                }
+
+                const res = await messagesApi.list(folder.id);
+                const msgs = (res && res.messages) ? res.messages : [];
+                const out = msgs.slice(0, Math.max(1, Math.min(100, limit || 20))).map(m => ({
+                  id: m.id,
+                  headerMessageId: m.headerMessageId,
+                  subject: m.subject,
+                  date: m.date,
+                }));
+                try { if (res && res.id) await messagesApi.abortList(res.id); } catch {}
+
+                return { ok: true, folder, sample: out, totalSampled: out.length };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function replyToMessageDraftComposeApi(messageIdHeader, folderPath, replyAll, plainTextBody, htmlBody, includeQuotedOriginal = true, closeAfterSave = true) {
               try {
                 // Prefer using context.apiCan to access WebExtension namespaces from the experiment context.
@@ -2283,6 +2356,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await replyToMessageDraftComposeApi(args.messageId, args.folderPath, args.replyAll, args.plainTextBody, args.htmlBody, args.includeQuotedOriginal, args.closeAfterSave);
                 case "debugContext":
                   return debugContext();
+                case "debugMessagesList":
+                  return await debugMessagesList(args.folderPath, args.limit);
                 case "listLatestMessages":
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":
