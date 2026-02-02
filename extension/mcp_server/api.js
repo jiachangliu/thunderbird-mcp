@@ -26,6 +26,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const extensionRoot = context.extension.rootURI;
     const resourceName = "thunderbird-mcp";
 
+    // Access WebExtension APIs (MV2/MV3) from this experiment script.
+    // In Thunderbird, experiment parent scripts can access the extension's global via context.cloneScope.
+    const extBrowser = (context && context.cloneScope && context.cloneScope.browser) ? context.cloneScope.browser : null;
+
     resProto.setSubstitutionWithFlags(
       resourceName,
       extensionRoot,
@@ -181,6 +185,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             useClosePromptSave: { type: "boolean", description: "Use Thunderbird's close-window prompt (auto-click Save) to produce an Outlook-sendable Draft (default: false)" }
           },
           required: ["messageId", "folderPath", "body"]
+        }
+      },
+      {
+        name: "replyToMessageDraftComposeApi",
+        title: "Reply to Message (Save Draft via compose API)",
+        description: "Create a reply draft using Thunderbird's WebExtension compose API (messages.query + compose.beginReply + compose.setComposeDetails + compose.saveMessage). This should preserve native reply quoting and produce a real Draft without OS-level UI automation.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "RFC822 Message-ID header (same as other tools; e.g. 4f23...@...). Will be resolved via messages.query({headerMessageId})." },
+            replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
+            plainTextBody: { type: "string", description: "Reply body as plain text to insert ABOVE the quoted original. Newlines will be preserved." },
+            htmlBody: { type: "string", description: "Reply body as HTML to insert ABOVE the quoted original." },
+            includeQuotedOriginal: { type: "boolean", description: "Whether to keep the quoted original at bottom (default: true)." },
+            closeAfterSave: { type: "boolean", description: "Close the compose tab/window after saving (default: true)." }
+          },
+          required: ["messageId"]
         }
       },
       {
@@ -1764,6 +1785,75 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            async function replyToMessageDraftComposeApi(messageIdHeader, replyAll, plainTextBody, htmlBody, includeQuotedOriginal = true, closeAfterSave = true) {
+              try {
+                if (!extBrowser) {
+                  return { error: "WebExtension browser APIs are not available in this context (extBrowser is null)" };
+                }
+
+                // Resolve the WebExtension numeric messageId from a RFC822 Message-ID header.
+                // The compose.beginReply API requires the messages.* messageId (number).
+                const queryInfo = { headerMessageId: messageIdHeader };
+                const queryRes = await extBrowser.messages.query(queryInfo);
+                const messages = (queryRes && Array.isArray(queryRes.messages)) ? queryRes.messages : [];
+                if (messages.length === 0) {
+                  return { error: `messages.query() returned no results for headerMessageId=${messageIdHeader}` };
+                }
+
+                // Pick the first match. (If needed later, we can add folder disambiguation.)
+                const msg = messages[0];
+                const msgId = msg.id;
+
+                const replyType = replyAll ? "replyToAll" : "replyToSender";
+                const tab = await extBrowser.compose.beginReply(msgId, replyType);
+                const tabId = tab && tab.id;
+
+                // Get current compose HTML body (should include the quoted original in a reply compose).
+                const details = await extBrowser.compose.getComposeDetails(tabId);
+                const existingBody = (details && typeof details.body === "string") ? details.body : "";
+
+                let prefixHtml = "";
+                if (typeof htmlBody === "string" && htmlBody.trim()) {
+                  prefixHtml = htmlBody;
+                } else if (typeof plainTextBody === "string" && plainTextBody.length) {
+                  const esc = (s) => String(s)
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;");
+                  prefixHtml = `<p>${esc(plainTextBody).replace(/\r\n/g, "\n").replace(/\n/g, "<br>")}</p>`;
+                }
+
+                const newBody = includeQuotedOriginal ? (prefixHtml + existingBody) : prefixHtml;
+
+                // Update the compose body. This is treated as user-initiated.
+                await extBrowser.compose.setComposeDetails(tabId, { body: newBody });
+
+                // Save as a draft using Thunderbird's native save pipeline.
+                await extBrowser.compose.saveMessage(tabId, { mode: "draft" });
+
+                if (closeAfterSave) {
+                  try {
+                    await extBrowser.tabs.remove(tabId);
+                  } catch (e) {
+                    // Not fatal.
+                  }
+                }
+
+                return {
+                  ok: true,
+                  method: "compose-api",
+                  headerMessageId: messageIdHeader,
+                  resolvedMessageId: msgId,
+                  tabId,
+                  replyType,
+                  includeQuotedOriginal,
+                  closeAfterSave,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             function listLatestMessages(folderPath, limit) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
@@ -2008,6 +2098,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return openNativeReplyCompose(args.messageId, args.folderPath, args.replyAll);
                 case "replyToMessageDraft":
                   return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal, args.useClosePromptSave);
+                case "replyToMessageDraftComposeApi":
+                  return await replyToMessageDraftComposeApi(args.messageId, args.replyAll, args.plainTextBody, args.htmlBody, args.includeQuotedOriginal, args.closeAfterSave);
                 case "listLatestMessages":
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":

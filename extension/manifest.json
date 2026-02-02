@@ -27,7 +27,8 @@
     "addressBooks",
     "messagesRead",
     "accountsFolders",
-    "compose"
+    "compose",
+    "compose.save"
   ],
   "web_accessible_resources": [
     "httpd.sys.mjs"
