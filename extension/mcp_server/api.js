@@ -703,12 +703,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // Create a compose instance without opening a window.
-                let msgCompose;
-                try {
-                  msgCompose = msgComposeService.InitCompose(msgComposeParams);
-                } catch {
-                  msgCompose = msgComposeService.initCompose(msgComposeParams);
-                }
+                const msgCompose = Cc["@mozilla.org/messengercompose/compose;1"]
+                  .createInstance(Ci.nsIMsgCompose);
+                msgCompose.initialize(msgComposeParams);
 
                 msgCompose.SendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, null, null, null);
 
@@ -962,12 +959,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // Create a compose instance without opening a window.
-                let msgCompose;
-                try {
-                  msgCompose = msgComposeService.InitCompose(msgComposeParams);
-                } catch {
-                  msgCompose = msgComposeService.initCompose(msgComposeParams);
-                }
+                // (nsIMsgComposeService.InitCompose does not reliably return a usable nsIMsgCompose here)
+                const msgCompose = Cc["@mozilla.org/messengercompose/compose;1"]
+                  .createInstance(Ci.nsIMsgCompose);
+                msgCompose.initialize(msgComposeParams);
 
                 // Save as draft (should sync to the account Drafts folder).
                 msgCompose.SendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, null, null, null);
