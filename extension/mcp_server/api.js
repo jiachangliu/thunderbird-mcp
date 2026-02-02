@@ -1558,7 +1558,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       }
                                     } catch {}
 
-                                    // Close compose window -> triggers prompt; our dialogObserver will choose Save.
+                                    // Try explicit Save-as-Draft first (after insertion). Then close.
+                                    try {
+                                      if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_saveAsDraft");
+                                      const cmd = win.document && win.document.getElementById && win.document.getElementById("cmd_saveAsDraft");
+                                      if (cmd && typeof cmd.doCommand === "function") cmd.doCommand();
+                                    } catch {}
+
                                     const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                     _pendingTimers.add(tClose);
                                     tClose.init(
@@ -1589,7 +1595,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                           try { _pendingTimers.delete(tClose); } catch {}
                                         },
                                       },
-                                      800,
+                                      6000,
                                       Ci.nsITimer.TYPE_ONE_SHOT
                                     );
                                   },
