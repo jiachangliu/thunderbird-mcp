@@ -1544,13 +1544,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       quoteReady = !!win.document.querySelector("blockquote[type='cite'], .moz-cite-prefix, #divRplyFwdMsg");
                                     } catch {}
 
-                                    // Give it up to ~10s.
-                                    if (!quoteReady && poll.tries < 20) {
+                                    // Give it up to ~8s, but even if quote isn't ready, we still proceed to insert + close.
+                                    if (!quoteReady && poll.tries < 16) {
                                       const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                       _pendingTimers.add(t);
                                       t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} Services.tm.dispatchToMainThread(poll); } }, 500, Ci.nsITimer.TYPE_ONE_SHOT);
                                       return;
                                     }
+
+                                    try { Services.console.logStringMessage("thunderbird-mcp: inserting reply text then closing compose"); } catch {}
 
                                     // Insert reply text at the top.
                                     try {
@@ -1568,13 +1570,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       }
                                     } catch {}
 
-                                    // Try explicit Save-as-Draft first (after insertion). Then close.
-                                    try {
-                                      if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_saveAsDraft");
-                                      const cmd = win.document && win.document.getElementById && win.document.getElementById("cmd_saveAsDraft");
-                                      if (cmd && typeof cmd.doCommand === "function") cmd.doCommand();
-                                    } catch {}
-
+                                    // Close (this should trigger the Save/Discard/Cancel prompt).
                                     const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                     _pendingTimers.add(tClose);
                                     tClose.init(
@@ -1598,14 +1594,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                                 try { _pendingTimers.delete(t); } catch {}
                                               },
                                             },
-                                            20000,
+                                            25000,
                                             Ci.nsITimer.TYPE_ONE_SHOT
                                           );
 
                                           try { _pendingTimers.delete(tClose); } catch {}
                                         },
                                       },
-                                      6000,
+                                      1200,
                                       Ci.nsITimer.TYPE_ONE_SHOT
                                     );
                                   },
