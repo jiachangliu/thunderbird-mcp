@@ -2071,42 +2071,62 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const tabId = tab && tab.id;
 
                 // Wait for Thunderbird to finish inserting the quoted original.
-                // If we set the body too early, Thunderbird may later overwrite it when the quote loads.
+                // If we set too early, Thunderbird may later overwrite.
+                let detailsBefore = null;
                 let details = null;
-                let existingBody = "";
+
                 for (let i = 0; i < 40; i++) {
                   details = await composeApi.getComposeDetails(tabId);
-                  existingBody = (details && typeof details.body === "string") ? details.body : "";
-                  if (existingBody && /<blockquote[^>]*type=\"cite\"/i.test(existingBody)) {
+                  if (!detailsBefore) detailsBefore = details;
+
+                  const b = (details && typeof details.body === "string") ? details.body : "";
+                  const pb = (details && typeof details.plainTextBody === "string") ? details.plainTextBody : "";
+
+                  if ((b && /<blockquote[^>]*type=\"cite\"/i.test(b)) || (pb && pb.includes("wrote:"))) {
                     break;
                   }
-                  // try compose state as a secondary signal
-                  try {
-                    const st = await composeApi.getComposeState(tabId);
-                    if (st && st.canSend) {
-                      // still might not include quote; keep waiting a bit
-                    }
-                  } catch {}
                   await new Promise(r => Services.tm.dispatchToMainThread(() => r()));
-                  // small yield; repeat
                 }
 
-                let prefixHtml = "";
+                const isPlain = !!(details && (details.isPlainText || typeof details.plainTextBody === "string"));
+                const existingBody = (details && typeof details.body === "string") ? details.body : "";
+                const existingPlain = (details && typeof details.plainTextBody === "string") ? details.plainTextBody : "";
+
+                // Build prefix
+                const plainPrefix = (typeof plainTextBody === "string") ? plainTextBody : "";
+                let htmlPrefix = "";
                 if (typeof htmlBody === "string" && htmlBody.trim()) {
-                  prefixHtml = htmlBody;
-                } else if (typeof plainTextBody === "string" && plainTextBody.length) {
+                  htmlPrefix = htmlBody;
+                } else if (plainPrefix) {
                   const esc = (s) => String(s)
                     .replace(/&/g, "&amp;")
                     .replace(/</g, "&lt;")
                     .replace(/>/g, "&gt;");
-                  prefixHtml = `<p>${esc(plainTextBody).replace(/\r\n/g, "\n").replace(/\n/g, "<br>")}</p>`;
+                  htmlPrefix = `<p>${esc(plainPrefix).replace(/\r\n/g, "\n").replace(/\n/g, "<br>")}</p>`;
                 }
 
-                const newBody = includeQuotedOriginal ? (prefixHtml + existingBody) : prefixHtml;
-                await composeApi.setComposeDetails(tabId, { body: newBody });
+                // Update compose using the correct field.
+                if (isPlain && plainPrefix) {
+                  const newPlain = includeQuotedOriginal ? (plainPrefix + "\n\n" + existingPlain) : plainPrefix;
+                  await composeApi.setComposeDetails(tabId, { plainTextBody: newPlain });
+                } else {
+                  const newBody = includeQuotedOriginal ? (htmlPrefix + existingBody) : htmlPrefix;
+                  await composeApi.setComposeDetails(tabId, { body: newBody });
+                }
+
+                const detailsAfterSet = await composeApi.getComposeDetails(tabId);
 
                 // Save after body is updated.
                 await composeApi.saveMessage(tabId, { mode: "draft" });
+
+                // Include some debug info so we can see what Thunderbird thought the compose body was.
+                const debug = {
+                  isPlain,
+                  hadBodyBefore: !!(detailsBefore && detailsBefore.body),
+                  hadPlainBefore: !!(detailsBefore && detailsBefore.plainTextBody),
+                  afterHasBody: !!(detailsAfterSet && detailsAfterSet.body),
+                  afterHasPlain: !!(detailsAfterSet && detailsAfterSet.plainTextBody),
+                };
 
                 if (closeAfterSave && tabsApi && typeof tabsApi.remove === "function") {
                   try { await tabsApi.remove(tabId); } catch {}
@@ -2121,6 +2141,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   replyType,
                   includeQuotedOriginal,
                   closeAfterSave,
+                  debug,
                 };
               } catch (e) {
                 return { error: e.toString() };
