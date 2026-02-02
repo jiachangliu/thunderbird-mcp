@@ -719,16 +719,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 .join("\r\n");
             }
 
-            function _formatReplyQuote(msg) {
-              // msg should be the getMessage() result shape.
-              const dateStr = msg.date ? new Date(msg.date).toLocaleString("en-US") : "";
-              const author = msg.author || "";
-              const header = dateStr
-                ? `On ${dateStr}, ${author} wrote:`
-                : `${author} wrote:`;
+            function _formatReplyHeaderBlock(msg) {
+              // Mimic Outlook/Thunderbird-style header block (like the Cornell Tech Housing draft).
+              const lines = [];
+              lines.push("-----Original Message-----");
 
+              const from = msg.author || "";
+              const sent = msg.date ? new Date(msg.date).toLocaleString("en-US") : "";
+              const to = msg.recipients || "";
+              const cc = msg.ccList || "";
+              const subject = msg.subject || "";
+
+              if (from) lines.push(`From: ${from}`);
+              if (sent) lines.push(`Sent: ${sent}`);
+              if (to) lines.push(`To: ${to}`);
+              if (cc) lines.push(`Cc: ${cc}`);
+              if (subject) lines.push(`Subject: ${subject}`);
+
+              return lines.join("\r\n");
+            }
+
+            function _formatReplyQuote(msg) {
+              const headerBlock = _formatReplyHeaderBlock(msg);
               const original = msg.bodyText || msg.body || "";
-              return header + "\r\n" + _quotePlainText(original);
+              return headerBlock + "\r\n\r\n" + _normalizeCRLF(original);
             }
 
             function _simpleHash32Hex(str) {
