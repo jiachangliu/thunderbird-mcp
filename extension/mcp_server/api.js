@@ -702,14 +702,47 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.identity = identity;
                 }
 
-                // Create a compose instance without opening a window.
-                const msgCompose = Cc["@mozilla.org/messengercompose/compose;1"]
-                  .createInstance(Ci.nsIMsgCompose);
-                msgCompose.initialize(msgComposeParams);
+                // We intentionally open the compose window briefly, save to Drafts, then close.
+                // This avoids relying on nsIMsgCompose.SendMsg (which is not exposed in some builds).
+                const observer = {
+                  observe(subject, topic) {
+                    if (topic !== "domwindowopened") return;
+                    const win = subject;
+                    win.addEventListener(
+                      "load",
+                      () => {
+                        try {
+                          const url = String(win.location);
+                          if (!url.includes("messengercompose")) return;
 
-                msgCompose.SendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, null, null, null);
+                          // Save draft
+                          win.goDoCommand("cmd_saveAsDraft");
 
-                return { success: true, message: "Draft save triggered" };
+                          // Close shortly after
+                          const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                          timer.init(
+                            {
+                              notify: () => {
+                                try { win.close(); } catch {}
+                                try { Services.ww.unregisterNotification(observer); } catch {}
+                              },
+                            },
+                            1200,
+                            Ci.nsITimer.TYPE_ONE_SHOT
+                          );
+                        } catch {
+                          try { Services.ww.unregisterNotification(observer); } catch {}
+                        }
+                      },
+                      { once: true }
+                    );
+                  },
+                };
+
+                Services.ww.registerNotification(observer);
+                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                return { success: true, message: "Draft window opened, save triggered, will close automatically" };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -958,16 +991,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.identity = identity;
                 }
 
-                // Create a compose instance without opening a window.
-                // (nsIMsgComposeService.InitCompose does not reliably return a usable nsIMsgCompose here)
-                const msgCompose = Cc["@mozilla.org/messengercompose/compose;1"]
-                  .createInstance(Ci.nsIMsgCompose);
-                msgCompose.initialize(msgComposeParams);
+                // Same approach as saveDraft(): briefly open compose window, save draft, close.
+                const observer = {
+                  observe(subject, topic) {
+                    if (topic !== "domwindowopened") return;
+                    const win = subject;
+                    win.addEventListener(
+                      "load",
+                      () => {
+                        try {
+                          const url = String(win.location);
+                          if (!url.includes("messengercompose")) return;
 
-                // Save as draft (should sync to the account Drafts folder).
-                msgCompose.SendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, null, null, null);
+                          win.goDoCommand("cmd_saveAsDraft");
 
-                return { success: true, message: "Draft save triggered", messageId, folderPath };
+                          const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                          timer.init(
+                            {
+                              notify: () => {
+                                try { win.close(); } catch {}
+                                try { Services.ww.unregisterNotification(observer); } catch {}
+                              },
+                            },
+                            1200,
+                            Ci.nsITimer.TYPE_ONE_SHOT
+                          );
+                        } catch {
+                          try { Services.ww.unregisterNotification(observer); } catch {}
+                        }
+                      },
+                      { once: true }
+                    );
+                  },
+                };
+
+                Services.ww.registerNotification(observer);
+                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                return { success: true, message: "Draft window opened, save triggered, will close automatically", messageId, folderPath };
               } catch (e) {
                 return { error: e.toString() };
               }
