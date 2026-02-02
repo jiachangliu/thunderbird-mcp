@@ -733,14 +733,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           t1.init(
                             {
                               notify: () => {
-                                // Try multiple ways to trigger "Save as Draft".
+                                // Prefer direct nsIMsgCompose access for this window.
                                 let saved = false;
                                 try {
-                                  if (typeof win.goDoCommand === "function") {
-                                    win.goDoCommand("cmd_saveAsDraft");
-                                    saved = true;
+                                  if (typeof msgComposeService.GetMsgComposeForWindow === "function") {
+                                    const comp = msgComposeService.GetMsgComposeForWindow(win);
+                                    if (comp) {
+                                      const sendFn = comp.SendMsg || comp.sendMsg;
+                                      if (typeof sendFn === "function") {
+                                        sendFn.call(comp, Ci.nsIMsgSend.nsMsgSaveAsDraft, msgComposeParams.identity || null, null, null, null);
+                                        saved = true;
+                                      }
+                                    }
                                   }
                                 } catch {}
+
+                                // Fallback to UI commands.
+                                if (!saved) {
+                                  try {
+                                    if (typeof win.goDoCommand === "function") {
+                                      win.goDoCommand("cmd_saveAsDraft");
+                                      saved = true;
+                                    }
+                                  } catch {}
+                                }
 
                                 if (!saved) {
                                   try {
