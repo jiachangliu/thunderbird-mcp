@@ -195,7 +195,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "replyToMessageDraftNativeEditor",
         title: "Reply to Message (Draft via native editor insert)",
-        description: "Open a native Reply compose window, insert the reply body using Thunderbird's editor APIs (no OS-level UI automation), then save as draft.",
+        description: "Open a native Reply compose (tab or window), insert the reply body using Thunderbird's editor APIs (no OS-level UI automation), then save as draft.",
         inputSchema: {
           type: "object",
           properties: {
@@ -203,7 +203,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "Folder URI (imap://.../INBOX)" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default false)" },
             plainTextBody: { type: "string", description: "Reply body to insert at top (plain text)." },
-            closeAfterSave: { type: "boolean", description: "Close compose window after saving (default true)" }
+            closeAfterSave: { type: "boolean", description: "Close compose tab/window after saving (default true)" }
           },
           required: ["messageId", "folderPath", "plainTextBody"]
         }
@@ -1497,102 +1497,142 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             async function replyToMessageDraftNativeEditor(messageId, folderPath, replyAll, plainTextBody, closeAfterSave = true) {
               try {
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) return { error: `Folder not found: ${folderPath}` };
-                const db = folder.msgDatabase;
-                if (!db) return { error: "Could not access folder database" };
-
-                let msgHdr = null;
-                for (const hdr of db.enumerateMessages()) {
-                  if (hdr.messageId === messageId) { msgHdr = hdr; break; }
+                // Open reply using native WebExtension compose API (so TB creates the quote/threading).
+                if (!context || !context.apiCan || typeof context.apiCan.findAPIPath !== "function") {
+                  return { error: "WebExtension API container (context.apiCan) is not available" };
                 }
-                if (!msgHdr) return { error: `Message not found: ${messageId}` };
+                const accountsApi = context.apiCan.findAPIPath("accounts");
+                const messagesApi = context.apiCan.findAPIPath("messages");
+                const composeApi = context.apiCan.findAPIPath("compose");
+                const tabsApi = context.apiCan.findAPIPath("tabs");
+                if (!accountsApi || !messagesApi || !composeApi) {
+                  return { error: "Could not resolve accounts/messages/compose API via context.apiCan" };
+                }
 
-                const identity = getIdentityForFolder(folder);
-                if (!identity) return { error: "Could not resolve identity" };
+                // Resolve message id (numeric) from folderPath + RFC822 Message-ID header.
+                function parseFolderUri(uri) {
+                  const m = String(uri || "").match(/^imap:\/\/(.+?)@([^\/]+)\/(.+)$/i);
+                  if (!m) return null;
+                  const user = decodeURIComponent(m[1]);
+                  const folderPathPart = "/" + m[3].replace(/^\/+/, "");
+                  return { user, folderPathPart };
+                }
+                function findFolderByPath(folders, wantedPath) {
+                  if (!Array.isArray(folders)) return null;
+                  for (const f of folders) {
+                    if (!f) continue;
+                    if (f.path === wantedPath) return f;
+                    const sub = findFolderByPath(f.subFolders || f.folders || f.subfolders, wantedPath);
+                    if (sub) return sub;
+                  }
+                  return null;
+                }
+                const parsed = parseFolderUri(folderPath);
+                if (!parsed) return { error: `Could not parse folderPath URI: ${folderPath}` };
 
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
-                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
-                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"].createInstance(Ci.nsIMsgCompFields);
+                const accounts = await accountsApi.list();
+                let folder = null;
+                for (const acct of accounts || []) {
+                  const match = (acct.identities || []).find(i => i && i.email && i.email.toLowerCase() === parsed.user.toLowerCase());
+                  if (!match) continue;
+                  folder = findFolderByPath(acct.folders, parsed.folderPathPart);
+                  if (folder) break;
+                }
+                if (!folder || !folder.id) return { error: `Could not resolve folder for ${folderPath}` };
 
-                msgComposeParams.type = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
-                msgComposeParams.format = Ci.nsIMsgCompFormat.Default;
-                msgComposeParams.composeFields = composeFields;
-                msgComposeParams.identity = identity;
-                msgComposeParams.originalMsgURI = msgHdr.folder.getUriForMsg(msgHdr);
+                let msgId = null;
+                let chunk = await messagesApi.list(folder.id);
+                const listId = chunk && chunk.id;
+                let safety = 0;
+                while (chunk && safety++ < 500) {
+                  for (const m of (chunk.messages || [])) {
+                    if (m && m.headerMessageId === messageId) { msgId = m.id; break; }
+                  }
+                  if (msgId) break;
+                  if (!chunk.id) break;
+                  try { chunk = await messagesApi.continueList(chunk.id); } catch { break; }
+                }
+                try { if (listId) await messagesApi.abortList(listId); } catch {}
+                if (!msgId) return { error: `Message not found in folder by headerMessageId: ${messageId}` };
 
-                // Observe the compose window, insert text when ready, then save as draft.
-                return await new Promise((resolve) => {
-                  let done = false;
+                const replyType = replyAll ? "replyToAll" : "replyToSender";
+                const tab = await composeApi.beginReply(msgId, replyType);
+                const tabId = tab && tab.id;
 
-                  const finish = (obj) => {
-                    if (done) return;
-                    done = true;
-                    try { Services.ww.unregisterNotification(observer); } catch {}
-                    resolve(obj);
-                  };
-
-                  const observer = {
-                    observe(subject, topic) {
-                      try {
-                        if (topic !== "domwindowopened") return;
-                        const win = subject.QueryInterface(Ci.nsIDOMWindow);
-                        win.addEventListener("load", () => {
-                          try {
-                            // Filter to compose windows.
-                            const href = String(win.location && win.location.href || "");
-                            if (!href.includes("messengercompose")) return;
-
-                            // Wait a bit for quote insertion.
-                            const sleep = (ms) => new Promise((resolve2) => {
-                              try {
-                                const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                t.initWithCallback({ notify: () => resolve2() }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
-                              } catch {
-                                // Fallback: next tick
-                                Services.tm.dispatchToMainThread({ run: () => resolve2() });
-                              }
-                            });
-
-                            (async () => {
-                              await sleep(600);
-                              const inserted = _insertTextAtTopOfCompose(win, plainTextBody);
-
-                              // Save as draft via native command.
-                              try {
-                                if (typeof win.goDoCommand === "function") {
-                                  win.goDoCommand("cmd_saveAsDraft");
-                                }
-                              } catch {}
-
-                              await sleep(1200);
-
-                              if (closeAfterSave) {
-                                try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
-                                try { if (!win.closed) win.close(); } catch {}
-                              }
-
-                              finish({ ok: true, inserted });
-                            })().catch((e) => finish({ error: String(e) }));
-                          } catch (e) {
-                            finish({ error: e.toString() });
-                          }
-                        }, { once: true });
-                      } catch {}
-                    },
-                  };
-
-                  Services.ww.registerNotification(observer);
-                  msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                  // Safety timeout.
+                // Locate the compose editor. In TB140, replies may open as a tab inside the 3-pane window.
+                const sleep = (ms) => new Promise((resolve2) => {
                   try {
                     const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                    t.initWithCallback({ notify: () => { if (!done) finish({ error: "Timeout waiting for compose window" }); } }, 15000, Ci.nsITimer.TYPE_ONE_SHOT);
+                    t.initWithCallback({ notify: () => resolve2() }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
                   } catch {
-                    // fallback: no-op
+                    Services.tm.dispatchToMainThread({ run: () => resolve2() });
                   }
                 });
+
+                function findComposeContentWindow() {
+                  // Prefer any mail:3pane window with a messageCompose tab.
+                  try {
+                    const en = Services.wm.getEnumerator("mail:3pane");
+                    while (en.hasMoreElements()) {
+                      const w = en.getNext();
+                      try {
+                        const tabmail = w.document && w.document.getElementById && w.document.getElementById("tabmail");
+                        if (!tabmail || !tabmail.tabInfo) continue;
+                        for (const ti of tabmail.tabInfo) {
+                          try {
+                            const modeName = ti.mode && (ti.mode.name || ti.mode.type || ti.mode);
+                            const isCompose = String(modeName || "").toLowerCase().includes("compose");
+                            const browser = ti.browser || ti.linkedBrowser;
+                            const cw = browser && browser.contentWindow;
+                            if (isCompose && cw && cw.gMsgCompose) {
+                              return { w, tabmail, ti, cw };
+                            }
+                            // Sometimes modeName isn't set; fall back to URL.
+                            const href = cw && cw.location && cw.location.href;
+                            if (href && String(href).includes("messengercompose") && cw.gMsgCompose) {
+                              return { w, tabmail, ti, cw };
+                            }
+                          } catch {}
+                        }
+                      } catch {}
+                    }
+                  } catch {}
+                  return null;
+                }
+
+                let found = null;
+                for (let i = 0; i < 40; i++) {
+                  found = findComposeContentWindow();
+                  if (found) break;
+                  await sleep(250);
+                }
+                if (!found) {
+                  return { error: "Timeout locating compose tab/editor (TB140 may not expose it as a window)" };
+                }
+
+                const inserted = _insertTextAtTopOfCompose(found.cw, plainTextBody);
+
+                // Save draft using the compose window command.
+                try {
+                  if (typeof found.cw.goDoCommand === "function") {
+                    found.cw.goDoCommand("cmd_saveAsDraft");
+                  }
+                } catch {}
+
+                await sleep(1500);
+
+                if (closeAfterSave) {
+                  try {
+                    // Close the compose tab.
+                    if (found.tabmail && typeof found.tabmail.closeTab === "function") {
+                      found.tabmail.closeTab(found.ti);
+                    } else if (tabsApi && typeof tabsApi.remove === "function") {
+                      await tabsApi.remove(tabId);
+                    }
+                  } catch {}
+                }
+
+                return { ok: true, tabId, inserted };
               } catch (e) {
                 return { error: e.toString() };
               }
