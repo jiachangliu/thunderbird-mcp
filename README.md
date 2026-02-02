@@ -55,6 +55,21 @@ Example for `~/.claude.json`:
 
 Compose tools open a window for you to review before sending. Nothing gets sent automatically.
 
+## Use native Thunderbird WebExtension APIs (preferred)
+
+When implementing new capabilities, **prefer Thunderbird's native WebExtension APIs** whenever possible. They are documented here:
+
+- <https://webextension-api.thunderbird.net/en/mv3/index.html>
+
+This documentation is the canonical reference for what extensions can do in a stable, supported way.
+
+Examples of high-leverage native APIs:
+- `browser.messages.*` – list/search/read messages, attachments, move/copy/delete (with the right permissions)
+- `browser.compose.*` – beginReply/beginNew, setComposeDetails, saveMessage (draft), sendMessage
+- `browser.accounts.*` – list accounts/identities/folders and resolve folder ids
+
+We still use XPCOM/Thunderbird-internal APIs in the experiment context for a few things, but the long-term direction is to minimize that and build on the official WebExtension surface.
+
 ## Security
 
 The extension only listens on localhost, but any local process can access it while Thunderbird is running. Keep this in mind on shared machines.
