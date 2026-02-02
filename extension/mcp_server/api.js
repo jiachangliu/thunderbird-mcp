@@ -1600,94 +1600,149 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             async function reviseDraftInPlaceNativeEditor(messageId, folderPath, plainTextBody, closeAfterSave = true) {
-              // Best-effort: open the existing draft, replace body, save.
+              // Open an existing draft using the WebExtension compose API (beginNew(messageId)),
+              // then overwrite the body using native editor APIs and save.
               // If TB creates a new draft item on save, delete the old one to avoid duplicates.
               try {
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) return { error: `Folder not found: ${folderPath}` };
-                const db = folder.msgDatabase;
-                if (!db) return { error: "Could not access folder database" };
-
-                let msgHdr = null;
-                for (const hdr of db.enumerateMessages()) {
-                  if (hdr.messageId === messageId) { msgHdr = hdr; break; }
+                if (!context || !context.apiCan || typeof context.apiCan.findAPIPath !== "function") {
+                  return { error: "WebExtension API container (context.apiCan) is not available" };
                 }
-                if (!msgHdr) return { error: `Draft not found: ${messageId}` };
+                const accountsApi = context.apiCan.findAPIPath("accounts");
+                const messagesApi = context.apiCan.findAPIPath("messages");
+                const composeApi = context.apiCan.findAPIPath("compose");
+                const tabsApi = context.apiCan.findAPIPath("tabs");
+                if (!accountsApi || !messagesApi || !composeApi) {
+                  return { error: "Could not resolve accounts/messages/compose API via context.apiCan" };
+                }
 
-                const wantedSubject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toString();
-                const before = _snapshotComposeTabs();
+                function parseFolderUri(uri) {
+                  const m = String(uri || "").match(/^imap:\/\/(.+?)@([^\/]+)\/(.+)$/i);
+                  if (!m) return null;
+                  const user = decodeURIComponent(m[1]);
+                  const folderPathPart = "/" + m[3].replace(/^\/+/, "");
+                  return { user, folderPathPart };
+                }
+                function findFolderByPath(folders, wantedPath) {
+                  if (!Array.isArray(folders)) return null;
+                  for (const f of folders) {
+                    if (!f) continue;
+                    if (f.path === wantedPath) return f;
+                    const sub = findFolderByPath(f.subFolders || f.folders || f.subfolders, wantedPath);
+                    if (sub) return sub;
+                  }
+                  return null;
+                }
+
+                const parsed = parseFolderUri(folderPath);
+                if (!parsed) return { error: `Could not parse folderPath URI: ${folderPath}` };
+
+                const accounts = await accountsApi.list();
+                let folder = null;
+                let desiredIdentityId = null;
+                for (const acct of accounts || []) {
+                  const match = (acct.identities || []).find(i => i && i.email && i.email.toLowerCase() === parsed.user.toLowerCase());
+                  if (!match) continue;
+                  desiredIdentityId = match.id || null;
+                  folder = findFolderByPath(acct.folders, parsed.folderPathPart);
+                  if (folder) break;
+                }
+                if (!folder || !folder.id) return { error: `Could not resolve folder for ${folderPath}` };
+
+                // Resolve numeric message id for this draft.
+                let msgId = null;
+                let chunk = await messagesApi.list(folder.id);
+                const listId = chunk && chunk.id;
+                let safety = 0;
+                while (chunk && safety++ < 500) {
+                  for (const m of (chunk.messages || [])) {
+                    if (m && m.headerMessageId === messageId) { msgId = m.id; break; }
+                  }
+                  if (msgId) break;
+                  if (!chunk.id) break;
+                  try { chunk = await messagesApi.continueList(chunk.id); } catch { break; }
+                }
+                try { if (listId) await messagesApi.abortList(listId); } catch {}
+                if (!msgId) return { error: `Draft not found in folder by headerMessageId: ${messageId}` };
+
                 const startedAt = Date.now();
 
-                const identity = getIdentityForFolder(folder);
-                if (!identity) return { error: "Could not resolve identity" };
-
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
-                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
-                msgComposeParams.type = Ci.nsIMsgCompType.Draft;
-                msgComposeParams.format = Ci.nsIMsgCompFormat.Default;
-                msgComposeParams.identity = identity;
-                msgComposeParams.originalMsgURI = msgHdr.folder.getUriForMsg(msgHdr);
-
                 // Open the draft for editing.
-                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+                const tab = await composeApi.beginNew(msgId);
+                const tabId = tab && tab.id;
 
-                // Wait for compose tab/window to appear.
-                let found = null;
-                for (let i = 0; i < 80; i++) {
-                  const after = _snapshotComposeTabs();
-                  found = _pickNewComposeTab(before, after, wantedSubject);
-                  if (found && found.cw && found.cw.gMsgCompose) break;
-                  await _sleep(250);
+                // Ensure identity.
+                if (desiredIdentityId) {
+                  try { await composeApi.setComposeDetails(tabId, { identityId: desiredIdentityId }); } catch {}
                 }
-                if (!found || !found.cw) return { error: "Timeout locating compose tab for draft" };
 
-                const replaced = _replaceBodyWithPlainText(found.cw, plainTextBody);
-
-                try { if (typeof found.cw.goDoCommand === "function") found.cw.goDoCommand("cmd_saveAsDraft"); } catch {}
-                await _sleep(2500);
-
-                // Detect duplicates: if another draft with same subject exists and is newer than start.
-                let newestSameSubject = null;
+                // Get the compose window via TabManager.
+                let cw = null;
                 try {
-                  const db2 = folder.msgDatabase;
-                  for (const hdr of db2.enumerateMessages()) {
-                    try {
-                      const subj = (hdr.mime2DecodedSubject || hdr.subject || "").toString();
-                      if (subj !== wantedSubject) continue;
-                      const dt = hdr.dateInSeconds ? hdr.dateInSeconds * 1000 : 0;
-                      if (dt >= startedAt - 2000) {
-                        if (!newestSameSubject || dt > (newestSameSubject.dateInSeconds * 1000)) {
-                          newestSameSubject = hdr;
-                        }
-                      }
-                    } catch {}
+                  const tm = context && context.extension && context.extension.tabManager;
+                  if (tm && typeof tm.get === "function") {
+                    const extTab = tm.get(tabId);
+                    if (extTab && extTab.nativeTab) cw = extTab.nativeTab;
                   }
                 } catch {}
 
+                // Fallback: scan.
+                if (!cw) {
+                  const after = _snapshotComposeTabs();
+                  const picked = after && after[0];
+                  cw = picked && picked.cw;
+                }
+
+                // Wait for gMsgCompose/editor.
+                for (let i = 0; i < 60 && (!cw || !cw.gMsgCompose); i++) {
+                  await _sleep(250);
+                }
+                if (!cw || !cw.gMsgCompose) return { error: "Timeout locating compose editor for draft" };
+
+                const replaced = _replaceBodyWithPlainText(cw, plainTextBody);
+                try { if (typeof cw.goDoCommand === "function") cw.goDoCommand("cmd_saveAsDraft"); } catch {}
+                await _sleep(2500);
+
+                // If save created a new draft entry, delete the old one.
                 let deletedOld = false;
                 let newMessageId = messageId;
                 try {
-                  if (newestSameSubject && newestSameSubject.messageId && newestSameSubject.messageId !== messageId) {
-                    // Delete the original draft header to avoid duplicates.
-                    try {
-                      msgHdr.folder.deleteMessages([msgHdr], null, true, false, null, false);
-                      deletedOld = true;
-                      newMessageId = newestSameSubject.messageId;
-                    } catch {}
+                  // Re-scan the Drafts folder and choose newest with same subject.
+                  const folderNative = MailServices.folderLookup.getFolderForURL(folderPath);
+                  const db = folderNative && folderNative.msgDatabase;
+                  if (db) {
+                    let origHdr = null;
+                    let newest = null;
+                    for (const hdr of db.enumerateMessages()) {
+                      if (hdr.messageId === messageId) origHdr = hdr;
+                      const subj = (hdr.mime2DecodedSubject || hdr.subject || "").toString();
+                      // Use subject match from composer if possible.
+                      let wantSubj = "";
+                      try { wantSubj = (cw.gMsgCompose && cw.gMsgCompose.compFields && cw.gMsgCompose.compFields.subject) || ""; } catch {}
+                      if (!wantSubj || subj !== String(wantSubj)) continue;
+                      const dt = hdr.dateInSeconds ? hdr.dateInSeconds * 1000 : 0;
+                      if (dt >= startedAt - 5000) {
+                        if (!newest || dt > (newest.dateInSeconds * 1000)) newest = hdr;
+                      }
+                    }
+                    if (newest && newest.messageId && newest.messageId !== messageId && origHdr) {
+                      try {
+                        origHdr.folder.deleteMessages([origHdr], null, true, false, null, false);
+                        deletedOld = true;
+                        newMessageId = newest.messageId;
+                      } catch {}
+                    }
                   }
                 } catch {}
 
                 if (closeAfterSave) {
                   try {
-                    if (found.tabmail && typeof found.tabmail.closeTab === "function" && found.ti) {
-                      found.tabmail.closeTab(found.ti);
-                    } else if (found.cw && !found.cw.closed) {
-                      found.cw.close();
+                    if (tabsApi && typeof tabsApi.remove === "function") {
+                      await tabsApi.remove(tabId);
                     }
                   } catch {}
                 }
 
-                return { ok: true, replaced, oldMessageId: messageId, messageId: newMessageId, deletedOld };
+                return { ok: true, replaced, oldMessageId: messageId, messageId: newMessageId, deletedOld, tabId };
               } catch (e) {
                 return { error: e.toString() };
               }
