@@ -971,7 +971,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             const runnable = {
                               run: () => {
                                 try {
-                                  const comp = msgComposeService.GetMsgComposeForWindow(win);
+                                  let comp = null;
+                                  try {
+                                    if (typeof msgComposeService.GetMsgComposeForWindow === "function") {
+                                      comp = msgComposeService.GetMsgComposeForWindow(win);
+                                    }
+                                  } catch {}
+                                  if (!comp) {
+                                    try {
+                                      // Compose window usually exposes gMsgCompose.
+                                      comp = win.gMsgCompose || null;
+                                    } catch {}
+                                  }
                                   if (!comp) {
                                     finish(false, "no-compose-instance");
                                     try { win.close(); } catch {}
