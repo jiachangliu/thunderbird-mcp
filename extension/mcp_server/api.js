@@ -193,6 +193,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         }
       },
       {
+        name: "replyToMessageDraftNativeEditor",
+        title: "Reply to Message (Draft via native editor insert)",
+        description: "Open a native Reply compose window, insert the reply body using Thunderbird's editor APIs (no OS-level UI automation), then save as draft.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "RFC822 Message-ID header" },
+            folderPath: { type: "string", description: "Folder URI (imap://.../INBOX)" },
+            replyAll: { type: "boolean", description: "Reply to all recipients (default false)" },
+            plainTextBody: { type: "string", description: "Reply body to insert at top (plain text)." },
+            closeAfterSave: { type: "boolean", description: "Close compose window after saving (default true)" }
+          },
+          required: ["messageId", "folderPath", "plainTextBody"]
+        }
+      },
+      {
         name: "replyToMessageDraft",
         title: "Reply to Message (Save Draft)",
         description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync). Includes quoted original message by default; supports idempotency to prevent duplicates.",
@@ -1429,6 +1445,158 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function _insertTextAtTopOfCompose(win, text) {
+              // Best-effort insertion at the beginning of the message body.
+              // This is intentionally defensive across Thunderbird versions.
+              try {
+                if (!win) return false;
+                const t = String(text || "");
+
+                // Try to get the editor.
+                let editor = null;
+                try {
+                  if (win.gMsgCompose && win.gMsgCompose.editor) {
+                    editor = win.gMsgCompose.editor;
+                  }
+                } catch {}
+                try {
+                  if (!editor && typeof win.GetCurrentEditor === "function") {
+                    editor = win.GetCurrentEditor();
+                  }
+                } catch {}
+
+                if (!editor) return false;
+
+                // Move caret to start and insert with line breaks.
+                try {
+                  if (typeof editor.beginningOfDocument === "function") {
+                    editor.beginningOfDocument();
+                  }
+                } catch {}
+
+                // Insert as text. In HTML editor, \n will typically become <br>.
+                try {
+                  if (typeof editor.insertText === "function") {
+                    editor.insertText(t + "\n\n");
+                    return true;
+                  }
+                } catch {}
+
+                // Fallback: use nsIHTMLEditor / nsIPlaintextEditor interfaces.
+                try {
+                  const plain = editor.QueryInterface(Ci.nsIPlaintextEditor);
+                  plain.insertText(t + "\n\n");
+                  return true;
+                } catch {}
+
+                return false;
+              } catch {
+                return false;
+              }
+            }
+
+            async function replyToMessageDraftNativeEditor(messageId, folderPath, replyAll, plainTextBody, closeAfterSave = true) {
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) return { error: `Folder not found: ${folderPath}` };
+                const db = folder.msgDatabase;
+                if (!db) return { error: "Could not access folder database" };
+
+                let msgHdr = null;
+                for (const hdr of db.enumerateMessages()) {
+                  if (hdr.messageId === messageId) { msgHdr = hdr; break; }
+                }
+                if (!msgHdr) return { error: `Message not found: ${messageId}` };
+
+                const identity = getIdentityForFolder(folder);
+                if (!identity) return { error: "Could not resolve identity" };
+
+                const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
+                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
+                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"].createInstance(Ci.nsIMsgCompFields);
+
+                msgComposeParams.type = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
+                msgComposeParams.format = Ci.nsIMsgCompFormat.Default;
+                msgComposeParams.composeFields = composeFields;
+                msgComposeParams.identity = identity;
+                msgComposeParams.originalMsgURI = msgHdr.folder.getUriForMsg(msgHdr);
+
+                // Observe the compose window, insert text when ready, then save as draft.
+                return await new Promise((resolve) => {
+                  let done = false;
+
+                  const finish = (obj) => {
+                    if (done) return;
+                    done = true;
+                    try { Services.ww.unregisterNotification(observer); } catch {}
+                    resolve(obj);
+                  };
+
+                  const observer = {
+                    observe(subject, topic) {
+                      try {
+                        if (topic !== "domwindowopened") return;
+                        const win = subject.QueryInterface(Ci.nsIDOMWindow);
+                        win.addEventListener("load", () => {
+                          try {
+                            // Filter to compose windows.
+                            const href = String(win.location && win.location.href || "");
+                            if (!href.includes("messengercompose")) return;
+
+                            // Wait a bit for quote insertion.
+                            const schedule = (ms, fn) => {
+                              Services.tm.dispatchToMainThread({ run: () => {
+                                try {
+                                  // crude delay loop
+                                  const start = Date.now();
+                                  while (Date.now() - start < ms) {}
+                                  fn();
+                                } catch {}
+                              }});
+                            };
+
+                            schedule(400, () => {
+                              const inserted = _insertTextAtTopOfCompose(win, plainTextBody);
+                              // Save as draft via native command.
+                              try {
+                                if (typeof win.goDoCommand === "function") {
+                                  win.goDoCommand("cmd_saveAsDraft");
+                                }
+                              } catch {}
+
+                              // Give TB a moment, then optionally close.
+                              schedule(600, () => {
+                                if (closeAfterSave) {
+                                  try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
+                                  try { if (!win.closed) win.close(); } catch {}
+                                }
+                                finish({ ok: true, inserted });
+                              });
+                            });
+                          } catch (e) {
+                            finish({ error: e.toString() });
+                          }
+                        }, { once: true });
+                      } catch {}
+                    },
+                  };
+
+                  Services.ww.registerNotification(observer);
+                  msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                  // Safety timeout.
+                  Services.tm.dispatchToMainThread({ run: () => {
+                    // ~10s safety
+                    const start = Date.now();
+                    while (Date.now() - start < 10000) {}
+                    if (!done) finish({ error: "Timeout waiting for compose window" });
+                  }});
+                });
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             function openNativeReplyCompose(messageId, folderPath, replyAll) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
@@ -2425,6 +2593,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal, args.useClosePromptSave);
                 case "replyToMessageDraftComposeApi":
                   return await replyToMessageDraftComposeApi(args.messageId, args.folderPath, args.replyAll, args.plainTextBody, args.htmlBody, args.includeQuotedOriginal, args.closeAfterSave);
+                case "replyToMessageDraftNativeEditor":
+                  return await replyToMessageDraftNativeEditor(args.messageId, args.folderPath, args.replyAll, args.plainTextBody, args.closeAfterSave);
                 case "debugContext":
                   return debugContext();
                 case "debugMessagesList":
