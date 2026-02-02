@@ -230,13 +230,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "reviseDraftInPlaceNativeEditor",
         title: "Revise Draft In Place (native editor)",
-        description: "Open an existing draft in a native compose tab/window, replace the body using Thunderbird editor APIs, then save. Attempts to avoid duplicates by deleting the previous draft if Thunderbird creates a new one.",
+        description: "Open an existing draft in a native compose tab/window and revise it using Thunderbird editor APIs, then save. Supports preserving the quoted original in reply drafts.",
         inputSchema: {
           type: "object",
           properties: {
             messageId: { type: "string", description: "RFC822 Message-ID header of the existing draft" },
             folderPath: { type: "string", description: "Folder URI where the draft lives (imap://.../Drafts)" },
-            plainTextBody: { type: "string", description: "New full body for the draft (plain text)." },
+            plainTextBody: { type: "string", description: "Replacement body text (plain text). If preserveQuotedOriginal=true, this replaces only the top text above the quote." },
+            preserveQuotedOriginal: { type: "boolean", description: "If true, keep the existing quoted original (blockquote cite) and replace only the text above it (default true)." },
             closeAfterSave: { type: "boolean", description: "Close compose tab/window after saving (default true)" }
           },
           required: ["messageId", "folderPath", "plainTextBody"]
@@ -1522,12 +1523,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!editor) return false;
 
                 // Select all + delete.
-                try {
-                  if (typeof editor.selectAll === "function") editor.selectAll();
-                } catch {}
+                try { if (typeof editor.selectAll === "function") editor.selectAll(); } catch {}
                 try {
                   if (typeof editor.deleteSelection === "function") {
-                    // "next" is safe enough for our use.
                     editor.deleteSelection("next", "strip");
                   }
                 } catch {}
@@ -1543,6 +1541,77 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   const plain = editor.QueryInterface(Ci.nsIPlaintextEditor);
                   plain.insertText(t + "\n");
+                  return true;
+                } catch {}
+
+                return false;
+              } catch {
+                return false;
+              }
+            }
+
+            function _replaceTopTextPreserveQuote(win, text) {
+              // Replace only the top part of the body, keeping the quoted original (first blockquote[type=cite]).
+              // If we can't find a quote block, fall back to full replace.
+              try {
+                if (!win) return false;
+                const t = String(text || "");
+
+                let editor = null;
+                try { if (win.gMsgCompose && win.gMsgCompose.editor) editor = win.gMsgCompose.editor; } catch {}
+                try { if (!editor && typeof win.GetCurrentEditor === "function") editor = win.GetCurrentEditor(); } catch {}
+                if (!editor) return false;
+
+                const doc = editor.document || (win.document || null);
+                if (!doc) return _replaceBodyWithPlainText(win, text);
+
+                // In TB compose, the quote is usually a blockquote in the editor document.
+                let quote = null;
+                try {
+                  quote = doc.querySelector && doc.querySelector('blockquote[type="cite"], blockquote[cite], blockquote');
+                } catch {}
+                if (!quote) {
+                  return _replaceBodyWithPlainText(win, text);
+                }
+
+                const body = doc.body || doc.documentElement;
+                if (!body) return _replaceBodyWithPlainText(win, text);
+
+                const rng = doc.createRange();
+                // Start from beginning of body content.
+                try { rng.setStart(body, 0); } catch { return _replaceBodyWithPlainText(win, text); }
+                // End just before quote.
+                try { rng.setEndBefore(quote); } catch { return _replaceBodyWithPlainText(win, text); }
+
+                const sel = editor.selection;
+                if (!sel) return _replaceBodyWithPlainText(win, text);
+
+                try {
+                  sel.removeAllRanges();
+                  sel.addRange(rng);
+                } catch {
+                  return _replaceBodyWithPlainText(win, text);
+                }
+
+                try {
+                  if (typeof editor.deleteSelection === "function") {
+                    editor.deleteSelection("next", "strip");
+                  }
+                } catch {
+                  // ignore
+                }
+
+                // Insert new top text.
+                try {
+                  if (typeof editor.insertText === "function") {
+                    editor.insertText(t + "\n\n");
+                    return true;
+                  }
+                } catch {}
+
+                try {
+                  const plain = editor.QueryInterface(Ci.nsIPlaintextEditor);
+                  plain.insertText(t + "\n\n");
                   return true;
                 } catch {}
 
@@ -1599,7 +1668,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return all[0] || null;
             }
 
-            async function reviseDraftInPlaceNativeEditor(messageId, folderPath, plainTextBody, closeAfterSave = true) {
+            async function reviseDraftInPlaceNativeEditor(messageId, folderPath, plainTextBody, preserveQuotedOriginal = true, closeAfterSave = true) {
               // Open an existing draft using the WebExtension compose API (beginNew(messageId)),
               // then overwrite the body using native editor APIs and save.
               // If TB creates a new draft item on save, delete the old one to avoid duplicates.
@@ -1698,7 +1767,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (!cw || !cw.gMsgCompose) return { error: "Timeout locating compose editor for draft" };
 
-                const replaced = _replaceBodyWithPlainText(cw, plainTextBody);
+                const replaced = preserveQuotedOriginal
+                  ? _replaceTopTextPreserveQuote(cw, plainTextBody)
+                  : _replaceBodyWithPlainText(cw, plainTextBody);
                 try { if (typeof cw.goDoCommand === "function") cw.goDoCommand("cmd_saveAsDraft"); } catch {}
                 await _sleep(2500);
 
@@ -2902,7 +2973,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "replyToMessageDraftNativeEditor":
                   return await replyToMessageDraftNativeEditor(args.messageId, args.folderPath, args.replyAll, args.plainTextBody, args.closeAfterSave);
                 case "reviseDraftInPlaceNativeEditor":
-                  return await reviseDraftInPlaceNativeEditor(args.messageId, args.folderPath, args.plainTextBody, args.closeAfterSave);
+                  return await reviseDraftInPlaceNativeEditor(args.messageId, args.folderPath, args.plainTextBody, args.preserveQuotedOriginal, args.closeAfterSave);
                 case "debugContext":
                   return debugContext();
                 case "debugMessagesList":
