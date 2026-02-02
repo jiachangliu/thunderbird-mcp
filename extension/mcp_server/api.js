@@ -1469,10 +1469,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                               }
 
                               if (!clicked) {
-                                // Last resort: send the 'S' key.
+                                // Last resort: synthesize the 'S' key (Save access key).
                                 try {
-                                  const ev = new win.KeyboardEvent("keydown", { key: "s", code: "KeyS" });
-                                  win.document.dispatchEvent(ev);
+                                  win.focus();
+                                } catch {}
+                                try {
+                                  const wu = win.windowUtils || win
+                                    .QueryInterface(Ci.nsIInterfaceRequestor)
+                                    .getInterface(Ci.nsIDOMWindowUtils);
+                                  if (wu && typeof wu.sendKeyEvent === "function") {
+                                    // DOM_VK_S = 83
+                                    wu.sendKeyEvent("keydown", 83, 0, 0);
+                                    wu.sendKeyEvent("keyup", 83, 0, 0);
+                                    clicked = true;
+                                  }
                                 } catch {}
                               }
                             } catch {
