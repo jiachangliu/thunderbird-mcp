@@ -40,10 +40,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       }
     } catch {}
     try {
-      if (!extBrowser && context && context.extension && Array.isArray(context.extension.views)) {
-        const bg = context.extension.views.find(v => v && v.viewType === "background" && v.xulBrowser && v.xulBrowser.contentWindow);
-        if (bg && bg.xulBrowser && bg.xulBrowser.contentWindow && bg.xulBrowser.contentWindow.browser) {
-          extBrowser = bg.xulBrowser.contentWindow.browser;
+      if (!extBrowser && context && context.extension && context.extension.views) {
+        const views = context.extension.views;
+        const iter = (views && typeof views[Symbol.iterator] === "function") ? views : [];
+        for (const v of iter) {
+          try {
+            if (v && v.viewType === "background" && v.xulBrowser && v.xulBrowser.contentWindow && v.xulBrowser.contentWindow.browser) {
+              extBrowser = v.xulBrowser.contentWindow.browser;
+              break;
+            }
+          } catch {}
         }
       }
     } catch {}
