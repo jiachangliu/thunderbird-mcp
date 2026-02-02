@@ -1524,59 +1524,58 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     observe(subjectWin, topic) {
                       if (topic !== "domwindowopened") return;
                       const win = subjectWin;
-                      win.addEventListener(
-                        "load",
-                        () => {
-                          try {
-                            const url = String(win.location);
-                            if (!url.includes("messengercompose")) return;
 
-                            // Insert reply text at top.
-                            const runnable = {
-                              run: () => {
-                                // Wait until Thunderbird has generated the quote/headers.
-                                const poll = {
-                                  tries: 0,
-                                  run: () => {
-                                    poll.tries++;
-                                    let quoteReady = false;
-                                    try {
-                                      quoteReady = !!win.document.querySelector("blockquote[type='cite'], .moz-cite-prefix, #divRplyFwdMsg");
-                                    } catch {}
+                      const onComposeReady = () => {
+                        try {
+                          const url = String(win.location);
+                          if (!url.includes("messengercompose")) return;
 
-                                    // Give it up to ~8s, but even if quote isn't ready, we still proceed to insert + close.
-                                    if (!quoteReady && poll.tries < 16) {
-                                      const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                      _pendingTimers.add(t);
-                                      t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} Services.tm.dispatchToMainThread(poll); } }, 500, Ci.nsITimer.TYPE_ONE_SHOT);
-                                      return;
+                          // Insert reply text at top.
+                          const runnable = {
+                            run: () => {
+                              // Wait until Thunderbird has generated the quote/headers.
+                              const poll = {
+                                tries: 0,
+                                run: () => {
+                                  poll.tries++;
+                                  let quoteReady = false;
+                                  try {
+                                    quoteReady = !!win.document.querySelector("blockquote[type='cite'], .moz-cite-prefix, #divRplyFwdMsg");
+                                  } catch {}
+
+                                  // Give it up to ~8s, but even if quote isn't ready, we still proceed to insert + close.
+                                  if (!quoteReady && poll.tries < 16) {
+                                    const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                    _pendingTimers.add(t);
+                                    t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} Services.tm.dispatchToMainThread(poll); } }, 500, Ci.nsITimer.TYPE_ONE_SHOT);
+                                    return;
+                                  }
+
+                                  try { Services.console.logStringMessage("thunderbird-mcp: inserting reply text then closing compose"); } catch {}
+
+                                  // Insert reply text at the top.
+                                  try {
+                                    const editor = (typeof win.GetCurrentEditor === "function")
+                                      ? win.GetCurrentEditor()
+                                      : (win.gMsgCompose && win.gMsgCompose.editor) || null;
+                                    const doc = editor && editor.document;
+                                    if (doc && doc.body) {
+                                      const safe = String(body || "")
+                                        .replace(/&/g, "&amp;")
+                                        .replace(/</g, "&lt;")
+                                        .replace(/>/g, "&gt;")
+                                        .replace(/\n/g, "<br>");
+                                      doc.body.insertAdjacentHTML("afterbegin", `<p>${safe}</p><p><br></p>`);
                                     }
+                                  } catch {}
 
-                                    try { Services.console.logStringMessage("thunderbird-mcp: inserting reply text then closing compose"); } catch {}
-
-                                    // Insert reply text at the top.
-                                    try {
-                                      const editor = (typeof win.GetCurrentEditor === "function")
-                                        ? win.GetCurrentEditor()
-                                        : (win.gMsgCompose && win.gMsgCompose.editor) || null;
-                                      const doc = editor && editor.document;
-                                      if (doc && doc.body) {
-                                        const safe = String(body || "")
-                                          .replace(/&/g, "&amp;")
-                                          .replace(/</g, "&lt;")
-                                          .replace(/>/g, "&gt;")
-                                          .replace(/\n/g, "<br>");
-                                        doc.body.insertAdjacentHTML("afterbegin", `<p>${safe}</p><p><br></p>`);
-                                      }
-                                    } catch {}
-
-                                    // Close (this should trigger the Save/Discard/Cancel prompt).
-                                    const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                    _pendingTimers.add(tClose);
-                                    tClose.init(
-                                      {
-                                        notify: () => {
-                                          try {
+                                  // Close (this should trigger the Save/Discard/Cancel prompt).
+                                  const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                  _pendingTimers.add(tClose);
+                                  tClose.init(
+                                    {
+                                      notify: () => {
+                                        try {
                                             if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close");
                                             else win.close();
                                           } catch {}
@@ -1614,9 +1613,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           } catch {
                             try { Services.ww.unregisterNotification(composeObserver); } catch {}
                           }
-                        },
-                        { once: true }
-                      );
+                        };
+
+                        // If load already fired, run immediately.
+                        try {
+                          if (win.document && win.document.readyState === "complete") {
+                            onComposeReady();
+                          } else {
+                            win.addEventListener("load", onComposeReady, { once: true });
+                          }
+                        } catch {
+                          // best effort
+                        }
                     },
                   };
 
