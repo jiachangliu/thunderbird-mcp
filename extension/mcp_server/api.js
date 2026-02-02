@@ -775,6 +775,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             const _pendingCopyListeners = new Set();
             const _pendingTimers = new Set();
+            const _pendingDraftMessageIds = new Set();
 
             function _copyFileToFolderAsDraft(file, folder, timeoutMs = 20000) {
               return new Promise((resolve, reject) => {
@@ -887,13 +888,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   idempotencyKey: key,
                 });
 
-                // Duplicate prevention: if a draft with this deterministic Message-ID already exists, do nothing.
+                // Duplicate prevention: prevent immediate retries from creating multiple drafts.
+                if (_pendingDraftMessageIds.has(messageId)) {
+                  return { success: true, message: "Draft already pending (idempotent)", draftsFolder: draftsURI, messageId };
+                }
+
+                // If a draft with this deterministic Message-ID already exists, do nothing.
                 const existing = _findDraftByMessageId(draftsFolder, messageId);
                 if (existing) {
                   return { success: true, message: "Draft already exists (idempotent)", draftsFolder: draftsURI, messageId };
                 }
 
                 const file = _writeStringToTempFileUtf8("tb-mcp-draft", rfc822);
+                _pendingDraftMessageIds.add(messageId);
 
                 // Schedule copy async so the HTTP handler returns immediately (some backends can block the main thread).
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -909,6 +916,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         try { Services.console.logStringMessage(`thunderbird-mcp: draft save failed: ${e}`); } catch {}
                       } finally {
                         try { _pendingTimers.delete(timer); } catch {}
+                        try { _pendingDraftMessageIds.delete(messageId); } catch {}
                       }
                     },
                   },
@@ -1190,12 +1198,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   idempotencyKey: key,
                 });
 
+                if (_pendingDraftMessageIds.has(draftMessageId)) {
+                  return { success: true, message: "Reply draft already pending (idempotent)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
+                }
+
                 const existing = _findDraftByMessageId(draftsFolder, draftMessageId);
                 if (existing) {
                   return { success: true, message: "Reply draft already exists (idempotent)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
                 }
 
                 const file = _writeStringToTempFileUtf8("tb-mcp-reply-draft", rfc822);
+                _pendingDraftMessageIds.add(draftMessageId);
 
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 _pendingTimers.add(timer);
@@ -1210,6 +1223,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         try { Services.console.logStringMessage(`thunderbird-mcp: reply draft save failed: ${e}`); } catch {}
                       } finally {
                         try { _pendingTimers.delete(timer); } catch {}
+                        try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
                       }
                     },
                   },
