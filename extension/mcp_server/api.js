@@ -830,11 +830,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 });
 
                 const file = _writeStringToTempFileUtf8("tb-mcp-draft", rfc822);
-                await _copyFileToFolderAsDraft(file, draftsFolder);
 
-                try { draftsFolder.updateFolder(null); } catch {}
+                // Schedule copy async so the HTTP handler returns immediately (some backends can block the main thread).
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.init(
+                  {
+                    notify: async () => {
+                      try {
+                        await _copyFileToFolderAsDraft(file, draftsFolder, 30000);
+                        try { draftsFolder.updateFolder(null); } catch {}
+                        try { Services.console.logStringMessage(`thunderbird-mcp: draft saved to ${draftsURI}`); } catch {}
+                      } catch (e) {
+                        try { Services.console.logStringMessage(`thunderbird-mcp: draft save failed: ${e}`); } catch {}
+                      }
+                    },
+                  },
+                  0,
+                  Ci.nsITimer.TYPE_ONE_SHOT
+                );
 
-                return { success: true, message: "Draft appended to IMAP Drafts (backend copy)", draftsFolder: draftsURI };
+                return { success: true, message: "Draft save scheduled (backend copy)", draftsFolder: draftsURI };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -1105,10 +1120,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 const file = _writeStringToTempFileUtf8("tb-mcp-reply-draft", rfc822);
-                await _copyFileToFolderAsDraft(file, draftsFolder);
-                try { draftsFolder.updateFolder(null); } catch {}
 
-                return { success: true, message: "Reply draft appended to IMAP Drafts (backend copy)", messageId, folderPath, draftsFolder: draftsURI };
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.init(
+                  {
+                    notify: async () => {
+                      try {
+                        await _copyFileToFolderAsDraft(file, draftsFolder, 30000);
+                        try { draftsFolder.updateFolder(null); } catch {}
+                        try { Services.console.logStringMessage(`thunderbird-mcp: reply draft saved to ${draftsURI}`); } catch {}
+                      } catch (e) {
+                        try { Services.console.logStringMessage(`thunderbird-mcp: reply draft save failed: ${e}`); } catch {}
+                      }
+                    },
+                  },
+                  0,
+                  Ci.nsITimer.TYPE_ONE_SHOT
+                );
+
+                return { success: true, message: "Reply draft save scheduled (backend copy)", messageId, folderPath, draftsFolder: draftsURI };
               } catch (e) {
                 return { error: e.toString() };
               }
