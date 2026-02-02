@@ -24,7 +24,7 @@ draft_id=$(python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\
 # Give IMAP a moment to materialize the draft.
 sleep 2
 
-revise=$(curl -sS -m 120 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reviseDraftInPlaceNativeEditor","arguments":{"messageId":"'"$draft_id"'","folderPath":"'"$FOLDER"'","plainTextBody":"New body line 1\nNew body line 2\n\nBest,\nJiachang","closeAfterSave":true}}}')
+revise=$(curl -sS -m 240 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reviseDraftInPlaceNativeEditor","arguments":{"messageId":"'"$draft_id"'","folderPath":"'"$FOLDER"'","plainTextBody":"New body line 1\nNew body line 2\n\nBest,\nJiachang","closeAfterSave":true}}}')
 
 echo "$revise" | head -c 400 >/dev/null
 
