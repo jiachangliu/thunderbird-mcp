@@ -1412,9 +1412,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         "load",
                         () => {
                           try {
-                            const url = String(win.location);
-                            // Common dialog window for confirm-save.
-                            if (!url.includes("commonDialog")) return;
+                            // The save-on-close prompt is usually a commonDialog, but can vary.
+                            // We just look for a <dialog> with a Save button and click it.
 
                             // Click the button whose label contains "Save" OR whose accessKey is "S".
                             // (The prompt shows Discard/Cancel/Save with S underlined.)
