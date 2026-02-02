@@ -151,6 +151,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         }
       },
       {
+        name: "openNativeReplyCompose",
+        title: "Open Native Reply Compose",
+        description: "Open a native Thunderbird Reply/ReplyAll compose window (with quoted original) for a message. Use UI automation to paste your reply at top.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string" },
+            folderPath: { type: "string" },
+            replyAll: { type: "boolean" }
+          },
+          required: ["messageId", "folderPath"]
+        }
+      },
+      {
         name: "replyToMessageDraft",
         title: "Reply to Message (Save Draft)",
         description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync). Includes quoted original message by default; supports idempotency to prevent duplicates.",
@@ -1350,6 +1364,42 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function openNativeReplyCompose(messageId, folderPath, replyAll) {
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+                const db = folder.msgDatabase;
+                if (!db) {
+                  return { error: "Could not access folder database" };
+                }
+                let msgHdr = null;
+                for (const hdr of db.enumerateMessages()) {
+                  if (hdr.messageId === messageId) { msgHdr = hdr; break; }
+                }
+                if (!msgHdr) {
+                  return { error: `Message not found: ${messageId}` };
+                }
+
+                const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
+                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
+                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"].createInstance(Ci.nsIMsgCompFields);
+
+                msgComposeParams.type = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
+                msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                msgComposeParams.composeFields = composeFields;
+                msgComposeParams.identity = getIdentityForFolder(folder);
+                msgComposeParams.originalMsgURI = msgHdr.folder.getUriForMsg(msgHdr);
+
+                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                return { success: true, message: "Native reply compose opened" };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml, idempotencyKey, includeQuotedOriginal = true, useClosePromptSave = false) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
@@ -1954,6 +2004,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return saveDraft(args.to, args.subject, args.body, args.cc, args.isHtml, args.idempotencyKey);
                 case "replyToMessage":
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
+                case "openNativeReplyCompose":
+                  return openNativeReplyCompose(args.messageId, args.folderPath, args.replyAll);
                 case "replyToMessageDraft":
                   return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal, args.useClosePromptSave);
                 case "listLatestMessages":
