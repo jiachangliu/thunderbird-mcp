@@ -310,12 +310,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "deleteMessages",
         title: "Delete Messages",
-        description: "Delete specific messages by message-id from a folder (state-changing; use with care)",
+        description: "Delete specific messages by message-id from a folder (state-changing; use with care). For Drafts, this may be implemented as a move to Deleted Items.",
         inputSchema: {
           type: "object",
           properties: {
             folderPath: { type: "string", description: "Folder URI" },
             messageIds: { type: "array", items: { type: "string" }, description: "List of message-id values to delete" }
+          },
+          required: ["folderPath", "messageIds"],
+        },
+      },
+      {
+        name: "purgeMessages",
+        title: "Purge Messages (hard delete)",
+        description: "Hard-delete messages from a folder by message-id (bypasses Drafts -> Deleted Items move). Use ONLY for cleanup of known test artifacts.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI" },
+            messageIds: { type: "array", items: { type: "string" }, description: "List of message-id values to purge" }
           },
           required: ["folderPath", "messageIds"],
         },
@@ -3146,6 +3159,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   } catch {}
                 }
 
+                return purgeMessages(folderPath, ids);
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function purgeMessages(folderPath, messageIds) {
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                const ids = Array.isArray(messageIds) ? messageIds : [];
                 const hdrs = _getMessageHdrsByIds(folder, ids);
                 if (hdrs.length === 0) {
                   return { success: true, deleted: 0, message: "No matching messages found" };
@@ -3158,7 +3185,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try {
                     folder.deleteMessages(hdrs, null, true, false, null);
                   } catch (e2) {
-                    return { error: `deleteMessages failed: ${e2.toString()}` };
+                    return { error: `purgeMessages failed: ${e2.toString()}` };
                   }
                 }
 
@@ -3272,6 +3299,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":
                   return await deleteMessages(args.folderPath, args.messageIds);
+                case "purgeMessages":
+                  return await purgeMessages(args.folderPath, args.messageIds);
                 case "moveMessages":
                   return await moveMessages(args.fromFolderPath, args.toFolderPath, args.messageIds);
                 case "getRawMessage":
