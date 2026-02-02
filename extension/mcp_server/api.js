@@ -27,8 +27,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     const resourceName = "thunderbird-mcp";
 
     // Access WebExtension APIs (MV2/MV3) from this experiment script.
-    // In Thunderbird, experiment parent scripts can access the extension's global via context.cloneScope.
-    const extBrowser = (context && context.cloneScope && context.cloneScope.browser) ? context.cloneScope.browser : null;
+    // Depending on Thunderbird version/context, the WebExtension global may be reachable from different paths.
+    let extBrowser = null;
+    try {
+      if (context && context.cloneScope && context.cloneScope.browser) {
+        extBrowser = context.cloneScope.browser;
+      }
+    } catch {}
+    try {
+      if (!extBrowser && context && context.extension && context.extension.apiManager && context.extension.apiManager.global && context.extension.apiManager.global.browser) {
+        extBrowser = context.extension.apiManager.global.browser;
+      }
+    } catch {}
+    try {
+      if (!extBrowser && context && context.extension && Array.isArray(context.extension.views)) {
+        const bg = context.extension.views.find(v => v && v.viewType === "background" && v.xulBrowser && v.xulBrowser.contentWindow);
+        if (bg && bg.xulBrowser && bg.xulBrowser.contentWindow && bg.xulBrowser.contentWindow.browser) {
+          extBrowser = bg.xulBrowser.contentWindow.browser;
+        }
+      }
+    } catch {}
 
     resProto.setSubstitutionWithFlags(
       resourceName,
