@@ -954,7 +954,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   };
 
                   const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                  timer.init({ notify: () => finish(false, "timeout") }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                  timer.init({ notify: () => { try { Services.ww.unregisterNotification(observer); } catch {} finish(false, "timeout"); } }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
 
                   const observer = {
                     observe(subjectWin, topic) {
@@ -1017,17 +1017,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                   // Start save.
                                   sendFn.call(comp, Ci.nsIMsgSend.nsMsgSaveAsDraft, identity || null, null, null, sendListener);
 
-                                  // Safety: close window if we never get callback but still finish.
-                                  const closeLater = {
-                                    run: () => {
-                                      if (finished) return;
-                                      if (!gotStop) {
-                                        try { win.close(); } catch {}
-                                        finish(true, "closed-without-callback");
-                                      }
-                                    },
-                                  };
-                                  Services.tm.dispatchToMainThread(closeLater);
+                                  // Do NOT close early. We must wait for onStopSending (or timeout) so the draft actually lands in Drafts.
                                 } catch (e) {
                                   try { win.close(); } catch {}
                                   finish(false, "exception", { error: String(e) });
