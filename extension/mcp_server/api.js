@@ -1500,78 +1500,78 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             // Insert reply text at top.
                             const runnable = {
                               run: () => {
-                                // Wait a bit for quote generation + editor initialization.
-                                const tIns = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                _pendingTimers.add(tIns);
-                                tIns.init(
-                                  {
-                                    notify: () => {
-                                      try {
-                                        // Prefer window editor helpers.
-                                        const editor = (typeof win.GetCurrentEditor === "function")
-                                          ? win.GetCurrentEditor()
-                                          : (win.gMsgCompose && win.gMsgCompose.editor) || null;
+                                // Wait until Thunderbird has generated the quote/headers, then insert our reply text at top.
+                                const poll = {
+                                  tries: 0,
+                                  run: () => {
+                                    poll.tries++;
+                                    let quoteReady = false;
+                                    try {
+                                      quoteReady = !!win.document.querySelector("blockquote[type='cite'], .moz-cite-prefix, #divRplyFwdMsg");
+                                    } catch {}
 
-                                        if (editor) {
-                                          try { editor.beginningOfDocument(); } catch {}
+                                    // Give it up to ~10s.
+                                    if (!quoteReady && poll.tries < 20) {
+                                      const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                      _pendingTimers.add(t);
+                                      t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} Services.tm.dispatchToMainThread(poll); } }, 500, Ci.nsITimer.TYPE_ONE_SHOT);
+                                      return;
+                                    }
 
-                                          // Insert as HTML so it shows correctly in rich editor.
-                                          const safe = String(body || "")
-                                            .replace(/&/g, "&amp;")
-                                            .replace(/</g, "&lt;")
-                                            .replace(/>/g, "&gt;")
-                                            .replace(/\n/g, "<br>");
+                                    try {
+                                      const editor = (typeof win.GetCurrentEditor === "function")
+                                        ? win.GetCurrentEditor()
+                                        : (win.gMsgCompose && win.gMsgCompose.editor) || null;
 
-                                          const html = `<p>${safe}</p><p><br></p>`;
+                                      if (editor) {
+                                        try { editor.beginningOfDocument(); } catch {}
+                                        try {
+                                          // Use insertText; it is most reliable across compose editors.
+                                          if (typeof editor.insertText === "function") {
+                                            editor.insertText(String(body || "") + "\n\n");
+                                          }
+                                        } catch {}
+                                      }
+                                    } catch {}
 
+                                    // Close shortly AFTER insertion.
+                                    const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                    _pendingTimers.add(tClose);
+                                    tClose.init(
+                                      {
+                                        notify: () => {
                                           try {
-                                            if (typeof editor.insertHTML === "function") editor.insertHTML(html);
-                                            else if (typeof editor.insertText === "function") editor.insertText(String(body || "") + "\n\n");
+                                            if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close");
+                                            else win.close();
                                           } catch {}
-                                        }
-                                      } catch {}
 
-                                      // Close shortly AFTER insertion.
-                                      const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                      _pendingTimers.add(tClose);
-                                      tClose.init(
-                                        {
-                                          notify: () => {
-                                            try {
-                                              if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close");
-                                              else win.close();
-                                            } catch {}
+                                          try { Services.ww.unregisterNotification(composeObserver); } catch {}
 
-                                            try { Services.ww.unregisterNotification(composeObserver); } catch {}
-
-                                            // Keep dialog observer around for a bit so it can catch the prompt.
-                                            const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                            _pendingTimers.add(t);
-                                            t.init(
-                                              {
-                                                notify: () => {
-                                                  try { Services.ww.unregisterNotification(dialogObserver); } catch {}
-                                                  try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
-                                                  try { _pendingTimers.delete(t); } catch {}
-                                                },
+                                          // Keep dialog observer around for a bit so it can catch the prompt.
+                                          const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                          _pendingTimers.add(t);
+                                          t.init(
+                                            {
+                                              notify: () => {
+                                                try { Services.ww.unregisterNotification(dialogObserver); } catch {}
+                                                try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
+                                                try { _pendingTimers.delete(t); } catch {}
                                               },
-                                              20000,
-                                              Ci.nsITimer.TYPE_ONE_SHOT
-                                            );
+                                            },
+                                            20000,
+                                            Ci.nsITimer.TYPE_ONE_SHOT
+                                          );
 
-                                            try { _pendingTimers.delete(tClose); } catch {}
-                                          },
+                                          try { _pendingTimers.delete(tClose); } catch {}
                                         },
-                                        800,
-                                        Ci.nsITimer.TYPE_ONE_SHOT
-                                      );
-
-                                      try { _pendingTimers.delete(tIns); } catch {}
-                                    },
+                                      },
+                                      1000,
+                                      Ci.nsITimer.TYPE_ONE_SHOT
+                                    );
                                   },
-                                  2500,
-                                  Ci.nsITimer.TYPE_ONE_SHOT
-                                );
+                                };
+
+                                Services.tm.dispatchToMainThread(poll);
                               },
                             };
                             Services.tm.dispatchToMainThread(runnable);
