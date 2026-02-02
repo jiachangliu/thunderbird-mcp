@@ -732,6 +732,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             const _pendingCopyListeners = new Set();
+            const _pendingTimers = new Set();
 
             function _copyFileToFolderAsDraft(file, folder, timeoutMs = 20000) {
               return new Promise((resolve, reject) => {
@@ -833,6 +834,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 // Schedule copy async so the HTTP handler returns immediately (some backends can block the main thread).
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                _pendingTimers.add(timer);
                 timer.init(
                   {
                     notify: async () => {
@@ -842,6 +844,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         try { Services.console.logStringMessage(`thunderbird-mcp: draft saved to ${draftsURI}`); } catch {}
                       } catch (e) {
                         try { Services.console.logStringMessage(`thunderbird-mcp: draft save failed: ${e}`); } catch {}
+                      } finally {
+                        try { _pendingTimers.delete(timer); } catch {}
                       }
                     },
                   },
@@ -1122,6 +1126,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const file = _writeStringToTempFileUtf8("tb-mcp-reply-draft", rfc822);
 
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                _pendingTimers.add(timer);
                 timer.init(
                   {
                     notify: async () => {
@@ -1131,6 +1136,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         try { Services.console.logStringMessage(`thunderbird-mcp: reply draft saved to ${draftsURI}`); } catch {}
                       } catch (e) {
                         try { Services.console.logStringMessage(`thunderbird-mcp: reply draft save failed: ${e}`); } catch {}
+                      } finally {
+                        try { _pendingTimers.delete(timer); } catch {}
                       }
                     },
                   },
