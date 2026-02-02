@@ -1825,6 +1825,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   extensionKeys: context && context.extension ? Object.getOwnPropertyNames(context.extension) : [],
                   hasApiManager: !!(context && context.extension && context.extension.apiManager),
                   apiManagerKeys: context && context.extension && context.extension.apiManager ? Object.getOwnPropertyNames(context.extension.apiManager) : [],
+                  hasBgFrameLoader: !!(context && context.extension && context.extension._backgroundPageFrameLoader),
+                  bgFrameLoaderKeys: (context && context.extension && context.extension._backgroundPageFrameLoader) ? Object.getOwnPropertyNames(context.extension._backgroundPageFrameLoader).slice(0,50) : [],
                   viewsType: (context && context.extension && context.extension.views) ? Object.prototype.toString.call(context.extension.views) : null,
                   viewsCtor: (context && context.extension && context.extension.views && context.extension.views.constructor) ? context.extension.views.constructor.name : null,
                   viewsIsArray: !!(context && context.extension && Array.isArray(context.extension.views)),
