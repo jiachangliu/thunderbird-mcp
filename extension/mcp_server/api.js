@@ -1906,29 +1906,35 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             async function replyToMessageDraftComposeApi(messageIdHeader, replyAll, plainTextBody, htmlBody, includeQuotedOriginal = true, closeAfterSave = true) {
               try {
-                if (!extBrowser) {
-                  return { error: "WebExtension browser APIs are not available in this context (extBrowser is null)" };
+                // Prefer using context.apiCan to access WebExtension namespaces from the experiment context.
+                if (!context || !context.apiCan || typeof context.apiCan.findAPIPath !== "function") {
+                  return { error: "WebExtension API container (context.apiCan) is not available" };
+                }
+
+                const messagesApi = context.apiCan.findAPIPath("messages");
+                const composeApi = context.apiCan.findAPIPath("compose");
+                const tabsApi = context.apiCan.findAPIPath("tabs");
+
+                if (!messagesApi || !composeApi) {
+                  return { error: "Could not resolve messages/compose API via context.apiCan" };
                 }
 
                 // Resolve the WebExtension numeric messageId from a RFC822 Message-ID header.
-                // The compose.beginReply API requires the messages.* messageId (number).
                 const queryInfo = { headerMessageId: messageIdHeader };
-                const queryRes = await extBrowser.messages.query(queryInfo);
+                const queryRes = await messagesApi.query(queryInfo);
                 const messages = (queryRes && Array.isArray(queryRes.messages)) ? queryRes.messages : [];
                 if (messages.length === 0) {
                   return { error: `messages.query() returned no results for headerMessageId=${messageIdHeader}` };
                 }
 
-                // Pick the first match. (If needed later, we can add folder disambiguation.)
                 const msg = messages[0];
                 const msgId = msg.id;
 
                 const replyType = replyAll ? "replyToAll" : "replyToSender";
-                const tab = await extBrowser.compose.beginReply(msgId, replyType);
+                const tab = await composeApi.beginReply(msgId, replyType);
                 const tabId = tab && tab.id;
 
-                // Get current compose HTML body (should include the quoted original in a reply compose).
-                const details = await extBrowser.compose.getComposeDetails(tabId);
+                const details = await composeApi.getComposeDetails(tabId);
                 const existingBody = (details && typeof details.body === "string") ? details.body : "";
 
                 let prefixHtml = "";
@@ -1943,24 +1949,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 const newBody = includeQuotedOriginal ? (prefixHtml + existingBody) : prefixHtml;
+                await composeApi.setComposeDetails(tabId, { body: newBody });
 
-                // Update the compose body. This is treated as user-initiated.
-                await extBrowser.compose.setComposeDetails(tabId, { body: newBody });
+                await composeApi.saveMessage(tabId, { mode: "draft" });
 
-                // Save as a draft using Thunderbird's native save pipeline.
-                await extBrowser.compose.saveMessage(tabId, { mode: "draft" });
-
-                if (closeAfterSave) {
-                  try {
-                    await extBrowser.tabs.remove(tabId);
-                  } catch (e) {
-                    // Not fatal.
-                  }
+                if (closeAfterSave && tabsApi && typeof tabsApi.remove === "function") {
+                  try { await tabsApi.remove(tabId); } catch {}
                 }
 
                 return {
                   ok: true,
-                  method: "compose-api",
+                  method: "compose-api (apiCan)",
                   headerMessageId: messageIdHeader,
                   resolvedMessageId: msgId,
                   tabId,
