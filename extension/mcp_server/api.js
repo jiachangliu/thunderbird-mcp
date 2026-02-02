@@ -222,6 +222,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath"]
         }
       },
+      {
+        name: "moveMessages",
+        title: "Move Messages",
+        description: "Move messages from one folder to another (e.g., Drafts -> Deleted Items)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            fromFolderPath: { type: "string", description: "Source folder URI" },
+            toFolderPath: { type: "string", description: "Destination folder URI" },
+            messageIds: { type: "array", items: { type: "string" }, description: "List of message-id values" }
+          },
+          required: ["fromFolderPath", "toFolderPath", "messageIds"]
+        }
+      },
     ];
 
     return {
@@ -1698,6 +1712,75 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function _getMessageHdrsByIds(folder, ids) {
+              const db = folder.msgDatabase;
+              if (!db) return [];
+              const out = [];
+              for (const id of ids) {
+                let found = null;
+                for (const hdr of db.enumerateMessages()) {
+                  if (hdr.messageId === id) {
+                    found = hdr;
+                    break;
+                  }
+                }
+                if (found) out.push(found);
+              }
+              return out;
+            }
+
+            function moveMessages(fromFolderPath, toFolderPath, messageIds) {
+              return new Promise((resolve) => {
+                try {
+                  const fromFolder = MailServices.folderLookup.getFolderForURL(fromFolderPath);
+                  const toFolder = MailServices.folderLookup.getFolderForURL(toFolderPath);
+                  if (!fromFolder) {
+                    resolve({ error: `Folder not found: ${fromFolderPath}` });
+                    return;
+                  }
+                  if (!toFolder) {
+                    resolve({ error: `Folder not found: ${toFolderPath}` });
+                    return;
+                  }
+
+                  const ids = Array.isArray(messageIds) ? messageIds : [];
+                  const hdrs = _getMessageHdrsByIds(fromFolder, ids);
+                  if (hdrs.length === 0) {
+                    resolve({ success: true, moved: 0, message: "No matching messages found" });
+                    return;
+                  }
+
+                  const copyService = MailServices.copy;
+                  const listener = {
+                    QueryInterface: ChromeUtils.generateQI([Ci.nsIMsgCopyServiceListener]),
+                    OnStartCopy() {},
+                    OnProgress() {},
+                    SetMessageKey() {},
+                    GetMessageId() {},
+                    OnStopCopy(status) {
+                      if (status && !Components.isSuccessCode(status)) {
+                        resolve({ error: `Move failed: ${status}` });
+                        return;
+                      }
+                      try { toFolder.updateFolder(null); } catch {}
+                      resolve({ success: true, moved: hdrs.length, fromFolderPath: fromFolder.URI, toFolderPath: toFolder.URI });
+                    },
+                  };
+
+                  const copyFn = copyService.CopyMessages || copyService.copyMessages;
+                  if (typeof copyFn !== "function") {
+                    resolve({ error: "Copy service missing CopyMessages/copyMessages" });
+                    return;
+                  }
+
+                  // isMove=true
+                  copyFn.call(copyService, fromFolder, hdrs, toFolder, true, listener, null, false);
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             function deleteMessages(folderPath, messageIds) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
@@ -1705,25 +1788,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Folder not found: ${folderPath}` };
                 }
 
-                const db = folder.msgDatabase;
-                if (!db) {
-                  return { error: "Could not access folder database" };
-                }
-
                 const ids = Array.isArray(messageIds) ? messageIds : [];
-                const hdrs = [];
 
-                for (const id of ids) {
-                  let found = null;
-                  for (const hdr of db.enumerateMessages()) {
-                    if (hdr.messageId === id) {
-                      found = hdr;
-                      break;
+                // Preference: Draft deletions should be a move to Deleted Items.
+                if (/\/Drafts$/i.test(folder.URI) || /\/Drafts\b/i.test(folder.URI)) {
+                  const deletedItemsURI = folder.URI.replace(/\/Drafts$/i, "/Deleted Items");
+                  // Best-effort move; if the destination doesn't exist, fall back to delete.
+                  try {
+                    const deletedFolder = MailServices.folderLookup.getFolderForURL(deletedItemsURI);
+                    if (deletedFolder) {
+                      return moveMessages(folder.URI, deletedItemsURI, ids);
                     }
-                  }
-                  if (found) hdrs.push(found);
+                  } catch {}
                 }
 
+                const hdrs = _getMessageHdrsByIds(folder, ids);
                 if (hdrs.length === 0) {
                   return { success: true, deleted: 0, message: "No matching messages found" };
                 }
@@ -1836,7 +1915,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listLatestMessages":
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":
-                  return deleteMessages(args.folderPath, args.messageIds);
+                  return await deleteMessages(args.folderPath, args.messageIds);
+                case "moveMessages":
+                  return await moveMessages(args.fromFolderPath, args.toFolderPath, args.messageIds);
                 case "getRawMessage":
                   return await getRawMessage(args.messageId, args.folderPath);
                 default:
