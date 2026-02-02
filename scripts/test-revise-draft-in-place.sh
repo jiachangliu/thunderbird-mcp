@@ -18,27 +18,21 @@ JSON
 resp=$(curl -sS -m 30 -X POST "$HOST" -H 'Content-Type: application/json' -d "$create_json")
 echo "$resp" | head -c 400 >/dev/null
 
-# Find the created draft id by listing Drafts.
-list=$(curl -sS -m 30 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"listLatestMessages","arguments":{"folderPath":"'"$FOLDER"'","limit":20}}}')
-
-draft_id=$(python3 - <<PY
+# Use the returned draft Message-ID directly (avoid timing issues with Drafts listing).
+draft_id=$(python3 - <<'PY'
 import json,re,sys
 raw=sys.stdin.read()
-# strip control chars
 raw=re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw)
 j=json.loads(raw)
 text=j['result']['content'][0]['text']
 text=re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
 obj=json.loads(text)
-subj="$SUBJECT"
-for it in obj.get('items', []):
-    if it.get('subject')==subj:
-        print(it.get('id'))
-        sys.exit(0)
-print('')
-sys.exit(1)
+print(obj['messageId'])
 PY
-<<<"$list")
+<<<"$resp")
+
+# Give IMAP a moment to materialize the draft.
+sleep 2
 
 revise=$(curl -sS -m 120 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reviseDraftInPlaceNativeEditor","arguments":{"messageId":"'"$draft_id"'","folderPath":"'"$FOLDER"'","plainTextBody":"New body line 1\nNew body line 2\n\nBest,\nJiachang","closeAfterSave":true}}}')
 
