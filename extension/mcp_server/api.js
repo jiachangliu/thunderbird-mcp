@@ -1561,7 +1561,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function _replaceTopTextPreserveQuote(win, text) {
               // Replace only the top part of the body, keeping the quoted original (first blockquote[type=cite]).
-              // Implemented by DOM surgery (more reliable than selection-based deletion across TB versions).
+              // IMPORTANT: use editor APIs / selection transactions so Thunderbird persists the change to the saved draft.
               try {
                 if (!win) return false;
                 const t = String(text || "");
@@ -1574,49 +1574,65 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const doc = editor.document || (win.document || null);
                 if (!doc) return _replaceBodyWithPlainText(win, text);
 
+                const body = doc.body || doc.documentElement;
+                if (!body) return _replaceBodyWithPlainText(win, text);
+
                 let quote = null;
                 try {
                   quote = doc.querySelector && doc.querySelector('blockquote[type="cite"], blockquote[cite], blockquote');
                 } catch {}
                 if (!quote) return _replaceBodyWithPlainText(win, text);
 
-                const body = doc.body || doc.documentElement;
-                if (!body) return _replaceBodyWithPlainText(win, text);
+                // Select everything from start of body up to (but not including) the quote.
+                let sel = null;
+                try { sel = editor.selection; } catch {}
+                try { if (!sel && typeof win.getSelection === "function") sel = win.getSelection(); } catch {}
+                if (!sel) return _replaceBodyWithPlainText(win, text);
 
-                // Remove everything before the quote block.
+                try { if (typeof editor.beginTransaction === "function") editor.beginTransaction(); } catch {}
+
                 try {
-                  while (body.firstChild && body.firstChild !== quote) {
-                    body.removeChild(body.firstChild);
-                  }
-                  // Sometimes quote isn't a direct child (e.g., preceded by moz-cite-prefix div).
-                  // In that case, remove nodes until we see the quote somewhere in the remaining subtree.
-                  let safety = 0;
-                  while (safety++ < 50) {
-                    const hasQuote = !!(body.querySelector && body.querySelector('blockquote[type="cite"], blockquote[cite], blockquote'));
-                    if (hasQuote) break;
-                    if (!body.firstChild) break;
-                    body.removeChild(body.firstChild);
-                  }
-                } catch {}
+                  const r = doc.createRange();
+                  r.setStart(body, 0);
+                  r.setEndBefore(quote);
 
-                // Re-find quote after removals.
-                try { quote = body.querySelector('blockquote[type="cite"], blockquote[cite], blockquote'); } catch {}
-                if (!quote) return _replaceBodyWithPlainText(win, text);
+                  try { sel.removeAllRanges(); } catch {}
+                  try { sel.addRange(r); } catch {}
 
-                // Insert a fresh <p> with the new text, preserving line breaks.
-                const p = doc.createElement("p");
-                const lines = t.split(/\r?\n/);
-                for (let i = 0; i < lines.length; i++) {
-                  p.appendChild(doc.createTextNode(lines[i]));
-                  if (i !== lines.length - 1) p.appendChild(doc.createElement("br"));
+                  // Delete the selected top portion.
+                  try {
+                    if (typeof editor.deleteSelection === "function") {
+                      editor.deleteSelection("next", "strip");
+                    }
+                  } catch {}
+
+                  // Move caret to start of body.
+                  try {
+                    const r2 = doc.createRange();
+                    r2.setStart(body, 0);
+                    r2.collapse(true);
+                    sel.removeAllRanges();
+                    sel.addRange(r2);
+                  } catch {}
+
+                  // Insert replacement text. Newlines will generally map to <br> or paragraphs depending on compose mode.
+                  try {
+                    if (typeof editor.insertText === "function") {
+                      editor.insertText(t + "\n\n");
+                      return true;
+                    }
+                  } catch {}
+
+                  try {
+                    const plain = editor.QueryInterface(Ci.nsIPlaintextEditor);
+                    plain.insertText(t + "\n\n");
+                    return true;
+                  } catch {}
+
+                  return false;
+                } finally {
+                  try { if (typeof editor.endTransaction === "function") editor.endTransaction(); } catch {}
                 }
-                // Add an extra blank line between top text and quote.
-                p.appendChild(doc.createElement("br"));
-                p.appendChild(doc.createElement("br"));
-
-                body.insertBefore(p, quote);
-
-                return true;
               } catch {
                 return false;
               }
@@ -1792,43 +1808,277 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (!cw || !cw.gMsgCompose) return { error: "Timeout locating compose editor for draft" };
 
-                const replaced = preserveQuotedOriginal
-                  ? _replaceTopTextPreserveQuote(cw, plainTextBody)
-                  : _replaceBodyWithPlainText(cw, plainTextBody);
-                try { if (typeof cw.goDoCommand === "function") cw.goDoCommand("cmd_saveAsDraft"); } catch {}
-                await _sleep(2500);
-
-                // If save created a new draft entry, delete the old one.
-                let deletedOld = false;
-                let newMessageId = messageId;
+                // Prefer WebExtension compose APIs for actually persisting the change into the draft.
+                // For reply-drafts, preserve the quoted original by keeping the existing HTML quote block intact.
+                let replaced = false;
                 try {
-                  // Re-scan the Drafts folder and choose newest with same subject.
-                  const folderNative = MailServices.folderLookup.getFolderForURL(folderPath);
-                  const db = folderNative && folderNative.msgDatabase;
-                  if (db) {
-                    let origHdr = null;
-                    let newest = null;
-                    for (const hdr of db.enumerateMessages()) {
-                      if (hdr.messageId === messageId) origHdr = hdr;
-                      const subj = (hdr.mime2DecodedSubject || hdr.subject || "").toString();
-                      // Use subject match from composer if possible.
-                      let wantSubj = "";
-                      try { wantSubj = (cw.gMsgCompose && cw.gMsgCompose.compFields && cw.gMsgCompose.compFields.subject) || ""; } catch {}
-                      if (!wantSubj || subj !== String(wantSubj)) continue;
-                      const dt = hdr.dateInSeconds ? hdr.dateInSeconds * 1000 : 0;
-                      if (dt >= startedAt - 5000) {
-                        if (!newest || dt > (newest.dateInSeconds * 1000)) newest = hdr;
-                      }
+                  if (preserveQuotedOriginal) {
+                    const details = await _withTimeout(composeApi.getComposeDetails(tabId), 8000, "compose.getComposeDetails");
+                    const existingBody = (details && typeof details.body === "string") ? details.body : "";
+
+                    function escHtml(s) {
+                      return String(s)
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;")
+                        .replace(/\"/g, "&quot;");
                     }
-                    if (newest && newest.messageId && newest.messageId !== messageId && origHdr) {
+                    const lines = String(plainTextBody || "").split(/\r?\n/).map(escHtml);
+                    const topHtml = `<p>${lines.join("<br>\n")}</p>\n<br>\n<br>\n`;
+
+                    // Split at the moz-cite-prefix (preferred) or the first blockquote.
+                    let idx = -1;
+                    idx = existingBody.indexOf('<div class="moz-cite-prefix"');
+                    if (idx < 0) idx = existingBody.search(/<blockquote[^>]*(type=\"cite\"|type='cite'|type=cite|cite=)/i);
+                    if (idx < 0) idx = existingBody.search(/<blockquote/i);
+
+                    const remainder = (idx >= 0) ? existingBody.slice(idx) : "";
+                    const newBody = remainder ? (topHtml + remainder) : topHtml;
+                    await _withTimeout(composeApi.setComposeDetails(tabId, { body: newBody }), 15000, "compose.setComposeDetails(body)");
+                    replaced = true;
+                  } else {
+                    // Full replace (no quote preservation).
+                    await _withTimeout(composeApi.setComposeDetails(tabId, { plainTextBody: String(plainTextBody || "") }), 15000, "compose.setComposeDetails(plainTextBody)");
+                    replaced = true;
+                  }
+                } catch {
+                  // Fallback to editor manipulation (best-effort).
+                  replaced = preserveQuotedOriginal
+                    ? _replaceTopTextPreserveQuote(cw, plainTextBody)
+                    : _replaceBodyWithPlainText(cw, plainTextBody);
+                }
+
+                function _linesFromText(t) {
+                  try {
+                    const lines = String(t || "")
+                      .split(/\r?\n/)
+                      .map(x => String(x || "").trim())
+                      .filter(Boolean);
+
+                    // Always keep token-like lines even if short.
+                    const tok = lines.filter(x => /\bTOK\d?\b|\bTOK[0-9-]/.test(x));
+                    const normal = lines
+                      // drop super-short filler lines ("Hi", etc.) unless token.
+                      .filter(x => x.length >= 5)
+                      .slice(0, 20);
+
+                    const merged = [];
+                    for (const x of tok.concat(normal)) {
+                      if (!merged.includes(x)) merged.push(x);
+                      if (merged.length >= 20) break;
+                    }
+                    return merged;
+                  } catch {
+                    return [];
+                  }
+                }
+
+                // Snapshot Drafts BEFORE save (newest N by date) so we can diff deterministically.
+                const wantLines = _linesFromText(plainTextBody);
+                const wantHasToken = wantLines.some(x => /\bTOK\d?\b|\bTOK[0-9-]/.test(x));
+                const before = { ids: [], items: [] };
+                try {
+                  const b = listLatestMessages(folderPath, 15);
+                  before.items = (b && b.items) ? b.items.map(x => ({ id: x.id, date: x.date, subject: x.subject })) : [];
+                  before.ids = before.items.map(x => x.id);
+                } catch {}
+
+                // Save via WebExtension compose API.
+                // If available, use compose.onAfterSave to learn the saved message-id deterministically.
+                let afterSaveInfo = null;
+                let afterSaveErr = null;
+                let removeAfterSave = null;
+                try {
+                  const evt = composeApi && composeApi.onAfterSave;
+                  if (evt && typeof evt.addListener === "function") {
+                    const handler = (savedTab, info) => {
                       try {
-                        origHdr.folder.deleteMessages([origHdr], null, true, false, null, false);
-                        deletedOld = true;
-                        newMessageId = newest.messageId;
-                      } catch {}
-                    }
+                        const id = savedTab && (savedTab.id || savedTab.tabId);
+                        if (id !== tabId) return;
+                        afterSaveInfo = info || { ok: true };
+                      } catch (e) {
+                        afterSaveErr = String(e);
+                      }
+                    };
+                    evt.addListener(handler);
+                    removeAfterSave = () => { try { evt.removeListener(handler); } catch {} };
                   }
                 } catch {}
+
+                let saveRes = null;
+                let onAfterSaveAvailable = false;
+                try {
+                  const evt = composeApi && composeApi.onAfterSave;
+                  onAfterSaveAvailable = !!(evt && typeof evt.addListener === "function");
+                } catch {}
+
+                try { saveRes = await _withTimeout(composeApi.saveMessage(tabId, { mode: "draft" }), 30000, "compose.saveMessage(draft)"); } catch (e) { afterSaveErr = String(e); }
+
+                // Give onAfterSave a moment to arrive.
+                for (let i = 0; i < 40 && !afterSaveInfo; i++) {
+                  await _sleep(250);
+                }
+                try { if (removeAfterSave) removeAfterSave(); } catch {}
+
+                await _sleep(1000);
+
+                // Try to refresh the folder DB after saving (IMAP Drafts can lag).
+                try {
+                  const folderNative = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (folderNative && typeof folderNative.updateFolder === "function") {
+                    folderNative.updateFolder(null);
+                  }
+                } catch {}
+
+                var __debugDetectDraft = null;
+
+                // Detect the *actual* saved draft.
+                let deletedOld = false;
+                let newMessageId = messageId;
+
+                const debugDetect = {
+                  wantLines,
+                  wantHasToken,
+                  before,
+                  onAfterSaveAvailable,
+                  saveRes,
+                  afterSaveInfo,
+                  afterSaveErr,
+                  attempts: 0,
+                  checked: [],
+                  picked: null,
+                  errors: [],
+                };
+
+                // Best case: compose.saveMessage returned the saved draft message(s).
+                try {
+                  const m = saveRes && saveRes.messages && saveRes.messages[0];
+                  const hid = m && (m.headerMessageId || m.headerMessageID || m.headerMessageId);
+                  if (hid) {
+                    newMessageId = hid;
+                    debugDetect.picked = { id: newMessageId, via: "compose.saveMessage.return.messages[0].headerMessageId" };
+                  }
+                } catch {}
+                __debugDetectDraft = debugDetect;
+
+                try {
+                  // If saveMessage already told us the id, we're done (avoid extra scanning).
+                  if (debugDetect.picked && debugDetect.picked.id) {
+                    // no-op
+                  } else {
+                    // Poll a few times; find the saved draft by walking recent items via messages API pagination.
+                    // Rationale: msgDatabase ordering can be stale/weird for IMAP Drafts; and messages.list() order may not
+                    // include the new draft in the first page. So we page a bit and filter by time window + subject.
+                    const startedAtMs = Date.now();
+                    let wantSubj = "";
+                    try { wantSubj = (cw.gMsgCompose && cw.gMsgCompose.compFields && cw.gMsgCompose.compFields.subject) || ""; } catch {}
+                    debugDetect.wantSubject = wantSubj;
+
+                    for (let attempt = 0; attempt < 12; attempt++) {
+                    debugDetect.attempts++;
+
+                    const cutoff = startedAtMs - 10 * 60 * 1000; // 10 minutes
+                    let candidates = [];
+                    let listId = null;
+                    let pages = 0;
+                    try {
+                      let chunk = await _withTimeout(messagesApi.list(folder.id), 10000, "messages.list(drafts after)");
+                      listId = chunk && chunk.id;
+                      while (chunk && pages++ < 8) {
+                        const msgs = (chunk.messages || []);
+                        for (const m of msgs) {
+                          try {
+                            if (!m || !m.headerMessageId) continue;
+                            if (wantSubj && (m.subject || "") !== wantSubj) continue;
+                            if (m.date && m.date < cutoff) continue;
+                            candidates.push({ id: m.headerMessageId, date: m.date || null, subject: m.subject || null });
+                          } catch {}
+                        }
+                        if (!chunk.id) break;
+                        chunk = await _withTimeout(messagesApi.continueList(chunk.id), 10000, "messages.continueList(drafts after)");
+                      }
+                    } catch (e) {
+                      debugDetect.errors.push({ stage: "messagesListPaged", error: String(e) });
+                    } finally {
+                      try { if (listId) await messagesApi.abortList(listId); } catch {}
+                    }
+
+                    debugDetect.pages = pages;
+                    debugDetect.candidateCount = candidates.length;
+
+                    // If subject filtering returned nothing, fall back to sampling newest regardless of subject.
+                    if (!candidates.length) {
+                      try {
+                        const a = listLatestMessages(folderPath, 40);
+                        candidates = (a && a.items) ? a.items.map(x => ({ id: x.id, date: x.date, subject: x.subject })) : [];
+                      } catch (e) {
+                        debugDetect.errors.push({ stage: "fallbackListLatest", error: String(e) });
+                        candidates = [];
+                      }
+                    }
+
+                    const beforeSet = new Set(before.ids || []);
+                    // Prefer new ids first.
+                    const newOnes = candidates.filter(x => x && x.id && !beforeSet.has(x.id));
+                    const scanList = (newOnes.length ? newOnes : candidates).slice(0, 25);
+
+                    let best = null;
+                    let fetched = 0;
+                    const maxFetch = 18;
+                    for (const c of scanList) {
+                      if (!c || !c.id) continue;
+                      if (fetched++ >= maxFetch) break;
+                      try {
+                        const rawObj = getRawMessage(c.id, folderPath);
+                        const src = rawObj && rawObj.source;
+                        const body = (src && src.includes("\r\n\r\n")) ? src.split("\r\n\r\n", 2)[1] : (src || "");
+                        let score = 0;
+                        for (const ln of wantLines) {
+                          if (body.includes(ln)) score++;
+                        }
+                        const isOld = (c.id === messageId);
+                        debugDetect.checked.push({ id: c.id, isOld, score, subject: c.subject || null, date: c.date || null, isNew: !beforeSet.has(c.id) });
+
+                        const threshold = wantHasToken ? 1 : 2;
+                        if (score >= threshold) {
+                          best = { id: c.id, score, isNew: !beforeSet.has(c.id) };
+                          break;
+                        }
+                      } catch (e) {
+                        debugDetect.checked.push({ id: c.id, error: true, err: String(e), isNew: !beforeSet.has(c.id) });
+                      }
+                    }
+
+                    if (best && best.id) {
+                      newMessageId = best.id;
+                      debugDetect.picked = best;
+                      break;
+                    }
+
+                    await _sleep(1200);
+                  }
+                  }
+                } catch (e) {
+                  debugDetect.errors.push({ stage: "detectLoop", error: String(e) });
+                }
+
+                // Best-effort delete old duplicate if we found a different id.
+                if (newMessageId && newMessageId !== messageId) {
+                  try {
+                    const folderNative = MailServices.folderLookup.getFolderForURL(folderPath);
+                    const db = folderNative && folderNative.msgDatabase;
+                    let origHdr = null;
+                    if (db) {
+                      for (const hdr of db.enumerateMessages()) {
+                        if (hdr && hdr.messageId === messageId) { origHdr = hdr; break; }
+                      }
+                    }
+                    if (origHdr && origHdr.folder) {
+                      origHdr.folder.deleteMessages([origHdr], null, true, false, null, false);
+                      deletedOld = true;
+                    }
+                  } catch {}
+                }
 
                 if (closeAfterSave) {
                   try {
@@ -1838,7 +2088,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   } catch {}
                 }
 
-                return { ok: true, replaced, oldMessageId: messageId, messageId: newMessageId, deletedOld, tabId };
+                const debug = { buildStamp: "reviseDraftInPlaceNativeEditor-debug-2026-02-02T20:14Z" };
+                try {
+                  if (typeof __debugDetectDraft !== "undefined") debug.detectSavedDraft = __debugDetectDraft;
+                } catch {}
+
+                return { ok: true, replaced, oldMessageId: messageId, messageId: newMessageId, deletedOld, tabId, debug };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -2764,14 +3019,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const max = Math.min(Math.max(parseInt(limit || 20, 10) || 20, 1), 100);
                 const msgs = [];
 
-                // Collect all headers then sort by date descending.
-                const all = [];
+                // Efficiently keep only the newest N headers (avoid sorting entire folder, which can be huge).
+                const top = [];
                 for (const hdr of db.enumerateMessages()) {
-                  all.push(hdr);
+                  const d = hdr && hdr.date ? hdr.date : 0;
+                  if (top.length < max) {
+                    top.push(hdr);
+                    top.sort((a, b) => (b.date || 0) - (a.date || 0));
+                  } else {
+                    const worst = top[top.length - 1];
+                    const wd = worst && worst.date ? worst.date : 0;
+                    if (d > wd) {
+                      top[top.length - 1] = hdr;
+                      top.sort((a, b) => (b.date || 0) - (a.date || 0));
+                    }
+                  }
                 }
-                all.sort((a, b) => (b.date || 0) - (a.date || 0));
 
-                for (const hdr of all.slice(0, max)) {
+                for (const hdr of top) {
                   msgs.push({
                     id: hdr.messageId,
                     subject: hdr.mime2DecodedSubject || hdr.subject,
