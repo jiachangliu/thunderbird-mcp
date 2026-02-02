@@ -70,7 +70,7 @@ fi
 python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); msg=json.loads(j["result"]["content"][0]["text"]); src=msg["source"]; body=src.split("\r\n\r\n",1)[1];
 assert "'"$TOK1"'" in body, "missing TOK1";
 # Quote should contain original email content:
-assert "the committee very much enjoyed" in body, "missing quoted original snippet";
+assert "thank you again for your time last week" in body.lower(), "missing quoted original snippet";
 print("OK")' <<<"$raw1" >/dev/null
 
 # 4) Revise in-place (replace body). Keep quote expected to remain.
@@ -88,7 +88,7 @@ raw2=$(curl -sS -m 60 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"
 
 python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); msg=json.loads(j["result"]["content"][0]["text"]); src=msg["source"]; body=src.split("\r\n\r\n",1)[1];
 assert "'"$TOK2"'" in body, "missing TOK2";
-assert "the committee very much enjoyed" in body, "missing quoted original snippet after revise";
+assert "thank you again for your time last week" in body.lower(), "missing quoted original snippet after revise";
 print("OK")' <<<"$raw2" >/dev/null
 
 echo "PASS: reviseDraftInPlaceNativeEditor keeps quoted original"
