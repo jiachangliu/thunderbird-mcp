@@ -94,10 +94,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             subject: { type: "string", description: "Email subject line" },
             body: { type: "string", description: "Email body text" },
             cc: { type: "string", description: "CC recipient (optional)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
           },
-          required: ["to", "subject", "body"],
-        },
+          required: ["to", "subject", "body"]
+        }
+      },
+      {
+        name: "saveDraft",
+        title: "Save Draft",
+        description: "Create a draft message (saved to the account Drafts folder for cloud sync) without opening a compose window",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text" },
+            cc: { type: "string", description: "CC recipient (optional)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
+          },
+          required: ["to", "subject", "body"]
+        }
       },
       {
         name: "listCalendars",
@@ -128,10 +144,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             body: { type: "string", description: "Reply body text" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
           },
-          required: ["messageId", "folderPath", "body"],
-        },
+          required: ["messageId", "folderPath", "body"]
+        }
+      },
+      {
+        name: "replyToMessageDraft",
+        title: "Reply to Message (Save Draft)",
+        description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync) without opening a compose window",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID to reply to (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            body: { type: "string", description: "Reply body text" },
+            replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
+          },
+          required: ["messageId", "folderPath", "body"]
+        }
       },
       {
         name: "setMessageRead",
@@ -630,6 +662,62 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function saveDraft(to, subject, body, cc, isHtml) {
+              try {
+                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                  .getService(Ci.nsIMsgComposeService);
+
+                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+                  .createInstance(Ci.nsIMsgComposeParams);
+
+                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+                  .createInstance(Ci.nsIMsgCompFields);
+
+                composeFields.to = to || "";
+                composeFields.cc = cc || "";
+                composeFields.subject = subject || "";
+
+                if (isHtml) {
+                  let bodyText = (body || "").replace(/\n/g, '');
+                  bodyText = [...bodyText].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
+                  composeFields.body = bodyText.includes('<html')
+                    ? bodyText
+                    : `<html><head><meta charset="UTF-8"></head><body>${bodyText}</body></html>`;
+                } else {
+                  const htmlBody = (body || "")
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/\n/g, '<br>');
+                  composeFields.body = `<html><body>${htmlBody}</body></html>`;
+                }
+
+                msgComposeParams.type = Ci.nsIMsgCompType.New;
+                msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                msgComposeParams.composeFields = composeFields;
+
+                const defaultAccount = MailServices.accounts.defaultAccount;
+                const identity = defaultAccount ? defaultAccount.defaultIdentity : null;
+                if (identity) {
+                  msgComposeParams.identity = identity;
+                }
+
+                // Create a compose instance without opening a window.
+                let msgCompose;
+                try {
+                  msgCompose = msgComposeService.InitCompose(msgComposeParams);
+                } catch {
+                  msgCompose = msgComposeService.initCompose(msgComposeParams);
+                }
+
+                msgCompose.SendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, null, null, null);
+
+                return { success: true, message: "Draft save triggered" };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             /**
              * Opens a reply compose window for a message.
              *
@@ -711,6 +799,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function getIdentityForFolder(folder) {
+              try {
+                const account = MailServices.accounts.findAccountForServer(folder.server);
+                if (account && account.defaultIdentity) return account.defaultIdentity;
+              } catch {}
+              try {
+                const defaultAccount = MailServices.accounts.defaultAccount;
+                if (defaultAccount && defaultAccount.defaultIdentity) return defaultAccount.defaultIdentity;
+              } catch {}
+              return null;
+            }
+
             function replyToMessage(messageId, folderPath, body, replyAll, isHtml) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
@@ -780,15 +880,99 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
                 msgComposeParams.composeFields = composeFields;
-
-                const account = MailServices.accounts.findAccountForServer(folder.server);
-                if (account) {
-                  msgComposeParams.identity = account.defaultIdentity;
-                }
+                msgComposeParams.identity = getIdentityForFolder(folder);
 
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
                 return { success: true, message: "Reply window opened" };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml) {
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                const db = folder.msgDatabase;
+                if (!db) {
+                  return { error: "Could not access folder database" };
+                }
+
+                let msgHdr = null;
+                for (const hdr of db.enumerateMessages()) {
+                  if (hdr.messageId === messageId) {
+                    msgHdr = hdr;
+                    break;
+                  }
+                }
+
+                if (!msgHdr) {
+                  return { error: `Message not found: ${messageId}` };
+                }
+
+                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                  .getService(Ci.nsIMsgComposeService);
+
+                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+                  .createInstance(Ci.nsIMsgComposeParams);
+
+                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+                  .createInstance(Ci.nsIMsgCompFields);
+
+                if (replyAll) {
+                  composeFields.to = msgHdr.author;
+                  const otherRecipients = (msgHdr.recipients || "").split(",")
+                    .map(r => r.trim())
+                    .filter(r => r && !r.includes(folder.server.username));
+                  if (otherRecipients.length > 0) {
+                    composeFields.cc = otherRecipients.join(", ");
+                  }
+                } else {
+                  composeFields.to = msgHdr.author;
+                }
+
+                const origSubject = msgHdr.subject || "";
+                composeFields.subject = origSubject.startsWith("Re:") ? origSubject : `Re: ${origSubject}`;
+                composeFields.references = `<${messageId}>`;
+
+                if (isHtml) {
+                  let bodyText = (body || "").replace(/\n/g, '');
+                  bodyText = [...bodyText].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
+                  composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${bodyText}</body></html>`;
+                } else {
+                  const htmlBody = (body || "")
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/\n/g, '<br>');
+                  composeFields.body = `<html><body>${htmlBody}</body></html>`;
+                }
+
+                msgComposeParams.type = Ci.nsIMsgCompType.New;
+                msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                msgComposeParams.composeFields = composeFields;
+
+                const identity = getIdentityForFolder(folder);
+                if (identity) {
+                  msgComposeParams.identity = identity;
+                }
+
+                // Create a compose instance without opening a window.
+                let msgCompose;
+                try {
+                  msgCompose = msgComposeService.InitCompose(msgComposeParams);
+                } catch {
+                  msgCompose = msgComposeService.initCompose(msgComposeParams);
+                }
+
+                // Save as draft (should sync to the account Drafts folder).
+                msgCompose.SendMsg(Ci.nsIMsgSend.nsMsgSaveAsDraft, identity, null, null, null);
+
+                return { success: true, message: "Draft save triggered", messageId, folderPath };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -812,8 +996,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listCalendars();
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
+                case "saveDraft":
+                  return saveDraft(args.to, args.subject, args.body, args.cc, args.isHtml);
                 case "replyToMessage":
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
+                case "replyToMessageDraft":
+                  return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
