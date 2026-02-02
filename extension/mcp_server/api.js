@@ -102,7 +102,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "saveDraft",
         title: "Save Draft",
-        description: "Create a draft message (saved to the account Drafts folder for cloud sync) without opening a compose window",
+        description: "Create a draft message (saved to the account Drafts folder for cloud sync). Supports idempotency to prevent duplicates.",
         inputSchema: {
           type: "object",
           properties: {
@@ -110,7 +110,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             subject: { type: "string", description: "Email subject line" },
             body: { type: "string", description: "Email body text" },
             cc: { type: "string", description: "CC recipient (optional)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional stable key to avoid creating duplicate drafts on retries" }
           },
           required: ["to", "subject", "body"]
         }
@@ -152,7 +153,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "replyToMessageDraft",
         title: "Reply to Message (Save Draft)",
-        description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync). Implementation opens compose briefly, triggers Save Draft, then closes.",
+        description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync). Supports idempotency to prevent duplicates.",
         inputSchema: {
           type: "object",
           properties: {
@@ -160,7 +161,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             body: { type: "string", description: "Reply body text" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional stable key to avoid creating duplicate reply drafts on retries" }
           },
           required: ["messageId", "folderPath", "body"]
         }
@@ -190,6 +192,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             read: { type: "boolean", description: "true to mark read, false to mark unread" }
           },
           required: ["messageId", "folderPath", "read"],
+        },
+      },
+      {
+        name: "deleteMessages",
+        title: "Delete Messages",
+        description: "Delete specific messages by message-id from a folder (state-changing; use with care)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI" },
+            messageIds: { type: "array", items: { type: "string" }, description: "List of message-id values to delete" }
+          },
+          required: ["folderPath", "messageIds"],
         },
       },
     ];
@@ -695,14 +710,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, "\r\n");
             }
 
-            function _makeRfc822Draft({ from, to, cc, subject, body, inReplyTo, references }) {
+            function _simpleHash32Hex(str) {
+              // Deterministic non-crypto hash for idempotency.
+              let h = 2166136261;
+              const s = String(str || "");
+              for (let i = 0; i < s.length; i++) {
+                h ^= s.charCodeAt(i);
+                h = Math.imul(h, 16777619);
+              }
+              // >>> 0 to unsigned
+              return (h >>> 0).toString(16);
+            }
+
+            function _sanitizeMessageIdToken(token) {
+              return String(token || "")
+                .toLowerCase()
+                .replace(/[^a-z0-9._-]+/g, "-")
+                .replace(/-+/g, "-")
+                .replace(/^-|-$/g, "")
+                .slice(0, 120);
+            }
+
+            function _makeRfc822Draft({ from, to, cc, subject, body, inReplyTo, references, idempotencyKey }) {
               const headers = [];
               headers.push(`From: ${from}`);
               if (to) headers.push(`To: ${to}`);
               if (cc) headers.push(`Cc: ${cc}`);
               if (subject !== undefined) headers.push(`Subject: ${subject || ""}`);
               headers.push(`Date: ${new Date().toUTCString()}`);
-              headers.push(`Message-ID: <tb-mcp-draft-${Date.now()}@local>`);
+
+              const token = idempotencyKey ? _sanitizeMessageIdToken(idempotencyKey) : null;
+              const messageId = token
+                ? `tb-mcp-draft-${token}@local`
+                : `tb-mcp-draft-${Date.now()}@local`;
+              headers.push(`Message-ID: <${messageId}>`);
+
               if (inReplyTo) headers.push(`In-Reply-To: <${inReplyTo.replace(/[<>]/g, "")}>`);
               if (references) headers.push(`References: ${references}`);
               headers.push("MIME-Version: 1.0");
@@ -711,7 +753,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // Mark as a draft for some servers/clients.
               headers.push("X-Mozilla-Draft-Info: internal/draft");
 
-              return headers.join("\r\n") + "\r\n\r\n" + _normalizeCRLF(body || "") + "\r\n";
+              return { rfc822: headers.join("\r\n") + "\r\n\r\n" + _normalizeCRLF(body || "") + "\r\n", messageId };
             }
 
             function _writeStringToTempFileUtf8(filenamePrefix, content) {
@@ -800,7 +842,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            async function saveDraft(to, subject, body, cc, isHtml) {
+            function _findDraftByMessageId(folder, messageId) {
+              try {
+                const db = folder.msgDatabase;
+                if (!db) return null;
+                for (const hdr of db.enumerateMessages()) {
+                  if (hdr.messageId === messageId) return hdr;
+                }
+                return null;
+              } catch {
+                return null;
+              }
+            }
+
+            async function saveDraft(to, subject, body, cc, isHtml, idempotencyKey) {
               try {
                 if (isHtml) {
                   return { error: "saveDraft currently supports isHtml=false only (plain text)" };
@@ -822,13 +877,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Drafts folder not found: ${draftsURI}` };
                 }
 
-                const rfc822 = _makeRfc822Draft({
+                const key = idempotencyKey || `new-${_simpleHash32Hex(`${to}|${cc}|${subject}|${body}`)}`;
+                const { rfc822, messageId } = _makeRfc822Draft({
                   from: _formatFrom(identity),
                   to: to || "",
                   cc: cc || "",
                   subject: subject || "",
                   body: body || "",
+                  idempotencyKey: key,
                 });
+
+                // Duplicate prevention: if a draft with this deterministic Message-ID already exists, do nothing.
+                const existing = _findDraftByMessageId(draftsFolder, messageId);
+                if (existing) {
+                  return { success: true, message: "Draft already exists (idempotent)", draftsFolder: draftsURI, messageId };
+                }
 
                 const file = _writeStringToTempFileUtf8("tb-mcp-draft", rfc822);
 
@@ -853,7 +916,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   Ci.nsITimer.TYPE_ONE_SHOT
                 );
 
-                return { success: true, message: "Draft save scheduled (backend copy)", draftsFolder: draftsURI };
+                return { success: true, message: "Draft save scheduled (backend copy)", draftsFolder: draftsURI, messageId };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -1031,7 +1094,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml) {
+            async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml, idempotencyKey) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
                 if (!folder) {
@@ -1102,17 +1165,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.identity = identity;
                 }
 
-                // Save reply draft by appending an RFC822 message directly into the identity's Drafts folder.
-                const rfc822 = _makeRfc822Draft({
-                  from: _formatFrom(identity),
-                  to: composeFields.to || "",
-                  cc: composeFields.cc || "",
-                  subject: composeFields.subject || "",
-                  body: body || "",
-                  inReplyTo: msgHdr.messageId,
-                  references: composeFields.references || "",
-                });
-
                 const draftsURI = _getDraftsFolderURIForIdentity(identity);
                 if (!draftsURI) {
                   return { error: "Could not determine Drafts folder URI for identity" };
@@ -1121,6 +1173,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const draftsFolder = MailServices.folderLookup.getFolderForURL(draftsURI);
                 if (!draftsFolder) {
                   return { error: `Drafts folder not found: ${draftsURI}` };
+                }
+
+                // Duplicate prevention: deterministic Message-ID based on original message-id + body hash
+                const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${composeFields.to}|${composeFields.subject}|${body}`)}`;
+
+                // Save reply draft by appending an RFC822 message directly into the identity's Drafts folder.
+                const { rfc822, messageId: draftMessageId } = _makeRfc822Draft({
+                  from: _formatFrom(identity),
+                  to: composeFields.to || "",
+                  cc: composeFields.cc || "",
+                  subject: composeFields.subject || "",
+                  body: body || "",
+                  inReplyTo: msgHdr.messageId,
+                  references: composeFields.references || "",
+                  idempotencyKey: key,
+                });
+
+                const existing = _findDraftByMessageId(draftsFolder, draftMessageId);
+                if (existing) {
+                  return { success: true, message: "Reply draft already exists (idempotent)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
                 }
 
                 const file = _writeStringToTempFileUtf8("tb-mcp-reply-draft", rfc822);
@@ -1145,7 +1217,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   Ci.nsITimer.TYPE_ONE_SHOT
                 );
 
-                return { success: true, message: "Reply draft save scheduled (backend copy)", messageId, folderPath, draftsFolder: draftsURI };
+                return { success: true, message: "Reply draft save scheduled (backend copy)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -1193,6 +1265,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function deleteMessages(folderPath, messageIds) {
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                const db = folder.msgDatabase;
+                if (!db) {
+                  return { error: "Could not access folder database" };
+                }
+
+                const ids = Array.isArray(messageIds) ? messageIds : [];
+                const hdrs = [];
+
+                for (const id of ids) {
+                  let found = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (hdr.messageId === id) {
+                      found = hdr;
+                      break;
+                    }
+                  }
+                  if (found) hdrs.push(found);
+                }
+
+                if (hdrs.length === 0) {
+                  return { success: true, deleted: 0, message: "No matching messages found" };
+                }
+
+                // Try common signatures across TB versions.
+                try {
+                  folder.deleteMessages(hdrs, null, true, false, null, false);
+                } catch {
+                  try {
+                    folder.deleteMessages(hdrs, null, true, false, null);
+                  } catch (e2) {
+                    return { error: `deleteMessages failed: ${e2.toString()}` };
+                  }
+                }
+
+                return { success: true, deleted: hdrs.length, folderPath: folder.URI };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "searchMessages":
@@ -1212,13 +1331,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
                 case "saveDraft":
-                  return saveDraft(args.to, args.subject, args.body, args.cc, args.isHtml);
+                  return saveDraft(args.to, args.subject, args.body, args.cc, args.isHtml, args.idempotencyKey);
                 case "replyToMessage":
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
                 case "replyToMessageDraft":
-                  return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
+                  return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey);
                 case "listLatestMessages":
                   return listLatestMessages(args.folderPath, args.limit);
+                case "deleteMessages":
+                  return deleteMessages(args.folderPath, args.messageIds);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
