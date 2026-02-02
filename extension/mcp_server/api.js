@@ -1545,14 +1545,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       }
                                     } catch {}
 
-                                    // Force an explicit Save-as-Draft first (more reliable than relying on close prompt timing).
-                                    try {
-                                      if (typeof win.goDoCommand === "function") {
-                                        win.goDoCommand("cmd_saveAsDraft");
-                                      }
-                                    } catch {}
-
-                                    // Close compose window -> prompt may still appear; our dialogObserver will choose Save.
+                                    // Close compose window -> triggers prompt; our dialogObserver will choose Save.
                                     const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                     _pendingTimers.add(tClose);
                                     tClose.init(
