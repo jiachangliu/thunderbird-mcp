@@ -163,7 +163,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             idempotencyKey: { type: "string", description: "Optional stable key to avoid creating duplicate reply drafts on retries" },
-            includeQuotedOriginal: { type: "boolean", description: "Whether to include quoted original message at bottom (default: true)" }
+            includeQuotedOriginal: { type: "boolean", description: "Whether to include quoted original message at bottom (default: true)" },
+            useClosePromptSave: { type: "boolean", description: "Use Thunderbird's close-window prompt (auto-click Save) to produce an Outlook-sendable Draft (default: false)" }
           },
           required: ["messageId", "folderPath", "body"]
         }
@@ -1304,7 +1305,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml, idempotencyKey, includeQuotedOriginal = true) {
+            async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml, idempotencyKey, includeQuotedOriginal = true, useClosePromptSave = false) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
                 if (!folder) {
@@ -1385,19 +1386,124 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Drafts folder not found: ${draftsURI}` };
                 }
 
+                // If requested, mimic human workflow:
+                // 1) open real Reply compose window (so TB generates quote + proper metadata)
+                // 2) insert our reply text at top
+                // 3) close window and auto-click "Save" on the prompt
+                if (useClosePromptSave) {
+                  const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${body}`)}`;
+                  const draftMessageId = `tb-mcp-draft-${_sanitizeMessageIdToken(key)}@${_getEmailDomain(identity)}`;
+
+                  if (_pendingDraftMessageIds.has(draftMessageId)) {
+                    return { success: true, message: "Reply draft already pending (idempotent)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
+                  }
+                  const existing = _findDraftByMessageId(draftsFolder, draftMessageId);
+                  if (existing) {
+                    return { success: true, message: "Reply draft already exists (idempotent)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
+                  }
+                  _pendingDraftMessageIds.add(draftMessageId);
+
+                  // Watch for the save-draft confirmation dialog and accept it.
+                  const dialogObserver = {
+                    observe(subjectWin, topic) {
+                      if (topic !== "domwindowopened") return;
+                      const win = subjectWin;
+                      win.addEventListener(
+                        "load",
+                        () => {
+                          try {
+                            const url = String(win.location);
+                            // Common dialog window for confirm-save.
+                            if (!url.includes("commonDialog")) return;
+
+                            // Auto-accept (equivalent to clicking "Save").
+                            try {
+                              win.document.documentElement.acceptDialog();
+                            } catch {
+                              try {
+                                if (typeof win.acceptDialog === "function") win.acceptDialog();
+                              } catch {}
+                            }
+                          } catch {}
+                        },
+                        { once: true }
+                      );
+                    },
+                  };
+                  Services.ww.registerNotification(dialogObserver);
+
+                  const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
+                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
+                  const cf = Cc["@mozilla.org/messengercompose/composefields;1"].createInstance(Ci.nsIMsgCompFields);
+
+                  // Let Thunderbird generate recipients/quote by using Reply/ReplyAll.
+                  msgComposeParams.type = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
+                  msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                  msgComposeParams.composeFields = cf;
+                  if (identity) msgComposeParams.identity = identity;
+
+                  // Set the original msgHdr so TB knows what we're replying to.
+                  msgComposeParams.originalMsgURI = msgHdr.folder.getUriForMsg(msgHdr);
+
+                  const composeObserver = {
+                    observe(subjectWin, topic) {
+                      if (topic !== "domwindowopened") return;
+                      const win = subjectWin;
+                      win.addEventListener(
+                        "load",
+                        () => {
+                          try {
+                            const url = String(win.location);
+                            if (!url.includes("messengercompose")) return;
+
+                            // Insert reply text at top.
+                            const runnable = {
+                              run: () => {
+                                try {
+                                  const comp = win.gMsgCompose;
+                                  const editor = comp && comp.editor;
+                                  if (editor) {
+                                    try { editor.beginningOfDocument(); } catch {}
+                                    editor.insertText(`${body || ""}\n\n`);
+                                  }
+                                } catch {}
+
+                                // Close compose window -> triggers "Save draft?" prompt -> our dialogObserver clicks Save.
+                                try {
+                                  if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close");
+                                  else win.close();
+                                } catch {}
+
+                                try { Services.ww.unregisterNotification(composeObserver); } catch {}
+                                // Keep dialog observer around briefly; it will fire on the prompt.
+                                const cleanup = { run: () => { try { Services.ww.unregisterNotification(dialogObserver); } catch {} try { _pendingDraftMessageIds.delete(draftMessageId); } catch {} } };
+                                Services.tm.dispatchToMainThread(cleanup);
+                              },
+                            };
+                            Services.tm.dispatchToMainThread(runnable);
+                          } catch {
+                            try { Services.ww.unregisterNotification(composeObserver); } catch {}
+                          }
+                        },
+                        { once: true }
+                      );
+                    },
+                  };
+
+                  Services.ww.registerNotification(composeObserver);
+                  msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                  return { success: true, message: "Reply compose opened; will auto-close and save draft via prompt", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
+                }
+
+                // Default behavior (existing path): build HTML quote ourselves and SaveAsDraft.
                 let finalBody = body || "";
                 let finalBodyHtml = "";
 
                 if (includeQuotedOriginal) {
                   try {
                     const orig = await getMessage(messageId, folderPath);
-                    if (!orig || orig.error) {
-                      // ignore
-                    } else {
-                      // Plaintext fallback quote
-                      finalBody = `${finalBody}\r\n\r\n${_formatReplyQuote(orig)}`;
-
-                      // HTML quote (Thunderbird/OWA-friendly)
+                    if (orig && !orig.error) {
                       const dateStr = orig.date ? new Date(orig.date).toLocaleString("en-US") : "";
                       const author = orig.author || "";
                       const citeMid = orig.id ? `mid:${orig.id}` : "";
@@ -1411,17 +1517,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       finalBodyHtml = `<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body>${replyHtml}${citePrefix}${quoted}</body></html>`;
                     }
-                  } catch {
-                    // ignore
-                  }
+                  } catch {}
                 }
 
-                // Duplicate prevention: deterministic Message-ID based on original message-id + body hash
                 const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${composeFields.to}|${composeFields.subject}|${finalBodyHtml || finalBody}`)}`;
-
-                // Prefer native Thunderbird Save-as-Draft (sets correct server flags for Outlook Web).
-                // We still keep idempotency via a deterministic synthetic id check in Drafts if possible.
-
                 const draftMessageId = `tb-mcp-draft-${_sanitizeMessageIdToken(key)}@${_getEmailDomain(identity)}`;
 
                 if (_pendingDraftMessageIds.has(draftMessageId)) {
@@ -1434,11 +1533,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 _pendingDraftMessageIds.add(draftMessageId);
-
-                // Build HTML body to mimic Thunderbird quote style.
                 const bodyHtml = finalBodyHtml || `<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body><p>${String(body || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>")}</p></body></html>`;
 
-                // Run native SaveAsDraft and wait for completion so we can confirm it actually created an item.
                 const saveRes = await _saveDraftViaComposeWindow({
                   identity,
                   to: composeFields.to || "",
@@ -1448,7 +1544,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 });
 
                 try { draftsFolder.updateFolder(null); } catch {}
-
                 try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
 
                 return { success: !!saveRes.ok, message: "Reply draft saved (native SaveAsDraft)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId, saveRes };
@@ -1633,7 +1728,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "replyToMessage":
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
                 case "replyToMessageDraft":
-                  return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal);
+                  return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal, args.useClosePromptSave);
                 case "listLatestMessages":
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":
