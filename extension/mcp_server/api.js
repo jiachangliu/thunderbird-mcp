@@ -223,6 +223,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         }
       },
       {
+        name: "debugContext",
+        title: "Debug Context",
+        description: "Return debugging info about the experiment context and any reachable WebExtension browser globals.",
+        inputSchema: { type: "object", properties: {}, required: [] }
+      },
+      {
         name: "listLatestMessages",
         title: "List Latest Messages (by folder)",
         description: "List the most recent messages in a folder WITHOUT changing any state. Useful for Drafts verification.",
@@ -1803,6 +1809,47 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function debugContext() {
+              try {
+                const info = {
+                  hasExtBrowser: !!extBrowser,
+                  extBrowserType: extBrowser ? typeof extBrowser : null,
+                  contextKeys: Object.getOwnPropertyNames(context || {}),
+                  hasExtension: !!(context && context.extension),
+                  extensionKeys: context && context.extension ? Object.getOwnPropertyNames(context.extension) : [],
+                  hasApiManager: !!(context && context.extension && context.extension.apiManager),
+                  apiManagerKeys: context && context.extension && context.extension.apiManager ? Object.getOwnPropertyNames(context.extension.apiManager) : [],
+                  viewsCount: (context && context.extension && Array.isArray(context.extension.views)) ? context.extension.views.length : null,
+                };
+
+                // Probe a few known paths.
+                const probes = {};
+                const paths = [
+                  "context.cloneScope.browser",
+                  "context.extension.apiManager.global.browser",
+                  "context.extension.backgroundPage",
+                  "context.extension.views",
+                ];
+
+                for (const p of paths) {
+                  try {
+                    let v;
+                    if (p === "context.cloneScope.browser") v = context.cloneScope && context.cloneScope.browser;
+                    if (p === "context.extension.apiManager.global.browser") v = context.extension && context.extension.apiManager && context.extension.apiManager.global && context.extension.apiManager.global.browser;
+                    if (p === "context.extension.backgroundPage") v = context.extension && context.extension.backgroundPage;
+                    if (p === "context.extension.views") v = context.extension && context.extension.views;
+                    probes[p] = v ? (typeof v) : null;
+                  } catch (e) {
+                    probes[p] = `ERR:${e}`;
+                  }
+                }
+                info.probes = probes;
+                return { ok: true, info };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function replyToMessageDraftComposeApi(messageIdHeader, replyAll, plainTextBody, htmlBody, includeQuotedOriginal = true, closeAfterSave = true) {
               try {
                 if (!extBrowser) {
@@ -2118,6 +2165,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal, args.useClosePromptSave);
                 case "replyToMessageDraftComposeApi":
                   return await replyToMessageDraftComposeApi(args.messageId, args.replyAll, args.plainTextBody, args.htmlBody, args.includeQuotedOriginal, args.closeAfterSave);
+                case "debugContext":
+                  return debugContext();
                 case "listLatestMessages":
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":
