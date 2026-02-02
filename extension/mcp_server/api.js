@@ -1532,9 +1532,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const accounts = await accountsApi.list();
                 let folder = null;
+                let desiredIdentityId = null;
                 for (const acct of accounts || []) {
                   const match = (acct.identities || []).find(i => i && i.email && i.email.toLowerCase() === parsed.user.toLowerCase());
                   if (!match) continue;
+                  desiredIdentityId = match.id || null;
                   folder = findFolderByPath(acct.folders, parsed.folderPathPart);
                   if (folder) break;
                 }
@@ -1558,6 +1560,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const replyType = replyAll ? "replyToAll" : "replyToSender";
                 const tab = await composeApi.beginReply(msgId, replyType);
                 const tabId = tab && tab.id;
+
+                // Ensure the correct identity (account) is selected for the compose tab.
+                // Without this, TB can sometimes pick the wrong default identity and save the draft
+                // into the wrong account's Drafts.
+                if (desiredIdentityId) {
+                  try {
+                    await composeApi.setComposeDetails(tabId, { identityId: desiredIdentityId });
+                  } catch {}
+                }
 
                 const sleep = (ms) => new Promise((resolve2) => {
                   try {
