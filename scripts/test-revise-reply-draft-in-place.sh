@@ -35,25 +35,37 @@ create=$(curl -sS -m 180 -X POST "$HOST" -H 'Content-Type: application/json' -d 
 
 echo "$create" | head -c 200 >/dev/null
 
-# 2) Find the created draft by searching for TOK1.
-search1=$(curl -sS -m 40 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"searchMessages","arguments":{"query":"'"$TOK1"'"}}}')
+# 2) Find the created draft by polling Drafts and searching raw MIME for TOK1.
+# (Thunderbird search index may lag, so don't rely on searchMessages here.)
 
-draft_id=$(python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); items=json.loads(j["result"]["content"][0]["text"]);
-if len(items)!=1:
-  print("FAIL: expected 1 search result for TOK1, got", len(items));
-  [print(it.get("folderPath"), it.get("id")) for it in items];
-  sys.exit(1)
-print(items[0]["id"])' <<<"$search1")
+draft_id=""
+for i in {1..30}; do
+  list=$(curl -sS -m 30 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"listLatestMessages","arguments":{"folderPath":"'"$DRAFTS"'","limit":20}}}')
+  # Extract ids from list and scan raw for TOK1.
+  ids=$(python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); text=j["result"]["content"][0]["text"]; text=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",text); obj=json.loads(text); print("\n".join([it.get("id","") for it in obj.get("items",[])]))' <<<"$list")
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    raw=$(curl -sS -m 30 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"getRawMessage","arguments":{"messageId":"'"$id"'","folderPath":"'"$DRAFTS"'"}}}')
+    found=$(python3 -c 'import json,re,sys; tok=sys.argv[1]; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); msg=json.loads(j["result"]["content"][0]["text"]); src=msg["source"]; body=src.split("\r\n\r\n",1)[1]; print("YES" if tok in body else "NO")' "$TOK1" <<<"$raw")
+    if [[ "$found" == "YES" ]]; then
+      draft_id="$id"
+      raw1="$raw"
+      break
+    fi
+  done <<<"$ids"
 
-draft_folder=$(python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); items=json.loads(j["result"]["content"][0]["text"]); print(items[0]["folderPath"])' <<<"$search1")
+  if [[ -n "$draft_id" ]]; then
+    break
+  fi
+  sleep 2
+done
 
-if [[ "$draft_folder" != "$DRAFTS" ]]; then
-  echo "FAIL: expected draft in Drafts folder, got: $draft_folder" >&2
+if [[ -z "$draft_id" ]]; then
+  echo "FAIL: could not find reply draft containing TOK1 in Drafts" >&2
   exit 1
 fi
 
 # 3) Verify original draft contains token and quoted original snippet.
-raw1=$(curl -sS -m 60 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"getRawMessage","arguments":{"messageId":"'"$draft_id"'","folderPath":"'"$DRAFTS"'"}}}')
 
 python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); msg=json.loads(j["result"]["content"][0]["text"]); src=msg["source"]; body=src.split("\r\n\r\n",1)[1];
 assert "'"$TOK1"'" in body, "missing TOK1";
