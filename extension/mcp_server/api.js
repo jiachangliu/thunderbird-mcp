@@ -454,6 +454,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const results = [];
               const lowerQuery = query ? query.toLowerCase() : "";
               const matchAll = !query || query.trim() === "";
+
+              // Tokenized matching: if query has multiple tokens, require all tokens to match
+              // across subject/author/recipients (order-insensitive). This makes searches like
+              // "Jiawei Ge Princeton SDS Seminar" work even though the subject contains punctuation.
+              const tokens = (lowerQuery || "")
+                .split(/[^a-z0-9@._-]+/i)
+                .map(t => t.trim())
+                .filter(Boolean);
+              const useTokenMatch = tokens.length >= 2;
+
+              function tokenMatch(haystack) {
+                if (!useTokenMatch) return false;
+                const h = String(haystack || "");
+                return tokens.every(t => h.includes(t));
+              }
               
               // Parse date filters
               let startTimestamp = null;
@@ -521,10 +536,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                     const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
 
+                    const combined = `${subject} ${author} ${recipients}`;
+
                     if (matchAll ||
-                        subject.includes(lowerQuery) ||
-                        author.includes(lowerQuery) ||
-                        recipients.includes(lowerQuery)) {
+                        (useTokenMatch ? tokenMatch(combined) : (
+                          subject.includes(lowerQuery) ||
+                          author.includes(lowerQuery) ||
+                          recipients.includes(lowerQuery)
+                        ))) {
                       allMatches.push({
                         id: msgHdr.messageId,
                         subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
