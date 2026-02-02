@@ -1437,25 +1437,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Build HTML body to mimic Thunderbird quote style.
                 const bodyHtml = finalBodyHtml || `<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body><p>${String(body || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>")}</p></body></html>`;
 
-                const runnable = {
-                  run: () => {
-                    _saveDraftViaComposeWindow({
-                      identity,
-                      to: composeFields.to || "",
-                      cc: composeFields.cc || "",
-                      subject: /^\s*re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`,
-                      bodyHtml,
-                    }).finally(() => {
-                      try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
-                      try { _pendingTimers.delete(runnable); } catch {}
-                    });
-                  },
-                };
+                // Run native SaveAsDraft and wait for completion so we can confirm it actually created an item.
+                const saveRes = await _saveDraftViaComposeWindow({
+                  identity,
+                  to: composeFields.to || "",
+                  cc: composeFields.cc || "",
+                  subject: /^\s*re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`,
+                  bodyHtml,
+                });
 
-                _pendingTimers.add(runnable);
-                Services.tm.dispatchToMainThread(runnable);
+                try { draftsFolder.updateFolder(null); } catch {}
 
-                return { success: true, message: "Reply draft save scheduled (native SaveAsDraft)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
+                try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
+
+                return { success: !!saveRes.ok, message: "Reply draft saved (native SaveAsDraft)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId, saveRes };
               } catch (e) {
                 return { error: e.toString() };
               }
