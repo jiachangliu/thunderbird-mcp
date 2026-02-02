@@ -1598,16 +1598,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                   return;
                                 }
 
-                                // Paste reply text like a human (Ctrl+V), then close like a human (Ctrl+W).
-                                try { win.focus(); } catch {}
+                                // Paste + close using Thunderbird commands (more reliable than synthetic key events).
+                                try {
+                                  const fm = Cc["@mozilla.org/focus-manager;1"].getService(Ci.nsIFocusManager);
+                                  try { win.focus(); } catch {}
+                                  try { fm.activeWindow = win; } catch {}
+                                } catch {}
+
                                 _setClipboardText(String(body || "") + "\n\n");
-                                _sendCtrlKey(win, 86); // Ctrl+V
 
-                                schedule(600, () => {
-                                  _sendCtrlKey(win, 87); // Ctrl+W
+                                // cmd_paste should paste into the currently-focused editor.
+                                try {
+                                  if (typeof win.goDoCommand === "function") {
+                                    win.goDoCommand("cmd_paste");
+                                  }
+                                } catch {}
 
-                                  // Fallback close
-                                  try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
+                                schedule(800, () => {
+                                  try {
+                                    if (typeof win.goDoCommand === "function") {
+                                      win.goDoCommand("cmd_close");
+                                    }
+                                  } catch {}
                                   try { if (!win.closed) win.close(); } catch {}
 
                                   try { Services.ww.unregisterNotification(composeObserver); } catch {}
