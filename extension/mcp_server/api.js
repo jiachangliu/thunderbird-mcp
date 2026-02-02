@@ -1525,15 +1525,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (topic !== "domwindowopened") return;
                       const win = subjectWin;
 
+                      let didRun = false;
+
                       const onComposeReady = () => {
+                        if (didRun) return;
+                        didRun = true;
+
                         try {
                           const url = String(win.location);
                           if (!url.includes("messengercompose")) return;
 
-                          // Insert reply text at top.
                           const runnable = {
                             run: () => {
-                              // Wait until Thunderbird has generated the quote/headers.
+                              try { Services.console.logStringMessage("thunderbird-mcp: compose hook fired (insert+close)"); } catch {}
+
                               const poll = {
                                 tries: 0,
                                 run: () => {
@@ -1543,7 +1548,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                     quoteReady = !!win.document.querySelector("blockquote[type='cite'], .moz-cite-prefix, #divRplyFwdMsg");
                                   } catch {}
 
-                                  // Give it up to ~8s, but even if quote isn't ready, we still proceed to insert + close.
                                   if (!quoteReady && poll.tries < 16) {
                                     const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                     _pendingTimers.add(t);
@@ -1551,9 +1555,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                     return;
                                   }
 
-                                  try { Services.console.logStringMessage("thunderbird-mcp: inserting reply text then closing compose"); } catch {}
-
-                                  // Insert reply text at the top.
+                                  // Insert reply text.
                                   try {
                                     const editor = (typeof win.GetCurrentEditor === "function")
                                       ? win.GetCurrentEditor()
@@ -1569,72 +1571,76 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                     }
                                   } catch {}
 
-                                  // Close (this should trigger the Save/Discard/Cancel prompt).
+                                  // Close compose.
                                   const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                   _pendingTimers.add(tClose);
                                   tClose.init(
                                     {
                                       notify: () => {
-                                        // Strong close sequence: cmd_close -> win.close() -> Ctrl+W
-                                        try {
-                                          if (typeof win.goDoCommand === "function") {
-                                            win.goDoCommand("cmd_close");
-                                          }
-                                        } catch {}
-
-                                        try {
-                                          // In case cmd_close didn't actually close.
-                                          if (!win.closed) {
-                                            win.close();
-                                          }
-                                        } catch {}
-
-                                        // Last resort: synthesize Ctrl+W
+                                        try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
+                                        try { if (!win.closed) win.close(); } catch {}
                                         try {
                                           const wu = win.windowUtils || win
                                             .QueryInterface(Ci.nsIInterfaceRequestor)
                                             .getInterface(Ci.nsIDOMWindowUtils);
                                           if (wu && typeof wu.sendKeyEvent === "function") {
-                                            const CTRL = 1; // KEYEVENT_CTRLDOWN
+                                            const CTRL = 1;
                                             wu.sendKeyEvent("keydown", 87, 0, CTRL);
                                             wu.sendKeyEvent("keyup", 87, 0, CTRL);
                                           }
                                         } catch {}
 
-                                          try { Services.ww.unregisterNotification(composeObserver); } catch {}
+                                        try { Services.ww.unregisterNotification(composeObserver); } catch {}
 
-                                          // Keep dialog observer around for a bit so it can catch the prompt.
-                                          const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                          _pendingTimers.add(t);
-                                          t.init(
-                                            {
-                                              notify: () => {
-                                                try { Services.ww.unregisterNotification(dialogObserver); } catch {}
-                                                try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
-                                                try { _pendingTimers.delete(t); } catch {}
-                                              },
+                                        const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                        _pendingTimers.add(t);
+                                        t.init(
+                                          {
+                                            notify: () => {
+                                              try { Services.ww.unregisterNotification(dialogObserver); } catch {}
+                                              try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
+                                              try { _pendingTimers.delete(t); } catch {}
                                             },
-                                            25000,
-                                            Ci.nsITimer.TYPE_ONE_SHOT
-                                          );
+                                          },
+                                          25000,
+                                          Ci.nsITimer.TYPE_ONE_SHOT
+                                        );
 
-                                          try { _pendingTimers.delete(tClose); } catch {}
-                                        },
+                                        try { _pendingTimers.delete(tClose); } catch {}
                                       },
-                                      1200,
-                                      Ci.nsITimer.TYPE_ONE_SHOT
-                                    );
-                                  },
-                                };
+                                    },
+                                    1200,
+                                    Ci.nsITimer.TYPE_ONE_SHOT
+                                  );
+                                },
+                              };
 
-                                Services.tm.dispatchToMainThread(poll);
-                              },
-                            };
-                            Services.tm.dispatchToMainThread(runnable);
-                          } catch {
-                            try { Services.ww.unregisterNotification(composeObserver); } catch {}
-                          }
-                        };
+                              Services.tm.dispatchToMainThread(poll);
+                            },
+                          };
+
+                          Services.tm.dispatchToMainThread(runnable);
+                        } catch {
+                          try { Services.ww.unregisterNotification(composeObserver); } catch {}
+                        }
+                      };
+
+                      // Multiple hooks + timed fallbacks
+                      try {
+                        if (win.document && win.document.readyState === "complete") {
+                          onComposeReady();
+                        } else {
+                          win.addEventListener("DOMContentLoaded", onComposeReady, { once: true });
+                          win.addEventListener("load", onComposeReady, { once: true });
+                        }
+                      } catch {}
+
+                      for (const ms of [1000, 3000, 6000]) {
+                        const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                        _pendingTimers.add(t);
+                        t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} onComposeReady(); } }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+                      }
+
 
                         // If load already fired, run immediately.
                         try {
