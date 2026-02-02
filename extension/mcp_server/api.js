@@ -1526,132 +1526,105 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       const win = subjectWin;
 
                       let didRun = false;
+                      let attempts = 0;
 
-                      const onComposeReady = () => {
+                      const schedule = (ms, fn) => {
+                        const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                        _pendingTimers.add(t);
+                        t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} fn(); } }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+                      };
+
+                      const tryRun = () => {
                         if (didRun) return;
+                        attempts += 1;
+
+                        let isCompose = false;
+                        try {
+                          isCompose = String(win.location).includes("messengercompose");
+                        } catch {}
+
+                        if (!isCompose) {
+                          if (attempts < 60) schedule(200, tryRun);
+                          return;
+                        }
+
+                        // Now run exactly once.
                         didRun = true;
 
-                        try {
-                          const url = String(win.location);
-                          if (!url.includes("messengercompose")) return;
+                        const runnable = {
+                          run: () => {
+                            const poll = {
+                              tries: 0,
+                              run: () => {
+                                poll.tries++;
+                                let quoteReady = false;
+                                try {
+                                  quoteReady = !!win.document.querySelector("blockquote[type='cite'], .moz-cite-prefix, #divRplyFwdMsg");
+                                } catch {}
 
-                          const runnable = {
-                            run: () => {
-                              try { Services.console.logStringMessage("thunderbird-mcp: compose hook fired (insert+close)"); } catch {}
+                                if (!quoteReady && poll.tries < 20) {
+                                  schedule(300, () => Services.tm.dispatchToMainThread(poll));
+                                  return;
+                                }
 
-                              const poll = {
-                                tries: 0,
-                                run: () => {
-                                  poll.tries++;
-                                  let quoteReady = false;
-                                  try {
-                                    quoteReady = !!win.document.querySelector("blockquote[type='cite'], .moz-cite-prefix, #divRplyFwdMsg");
-                                  } catch {}
-
-                                  if (!quoteReady && poll.tries < 16) {
-                                    const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                    _pendingTimers.add(t);
-                                    t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} Services.tm.dispatchToMainThread(poll); } }, 500, Ci.nsITimer.TYPE_ONE_SHOT);
-                                    return;
+                                // Insert reply text.
+                                try {
+                                  const editor = (typeof win.GetCurrentEditor === "function")
+                                    ? win.GetCurrentEditor()
+                                    : (win.gMsgCompose && win.gMsgCompose.editor) || null;
+                                  const doc = editor && editor.document;
+                                  if (doc && doc.body) {
+                                    const safe = String(body || "")
+                                      .replace(/&/g, "&amp;")
+                                      .replace(/</g, "&lt;")
+                                      .replace(/>/g, "&gt;")
+                                      .replace(/\n/g, "<br>");
+                                    doc.body.insertAdjacentHTML("afterbegin", `<p>${safe}</p><p><br></p>`);
                                   }
+                                } catch {}
 
-                                  // Insert reply text.
+                                // Close compose to trigger prompt.
+                                schedule(600, () => {
+                                  try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
+                                  try { if (!win.closed) win.close(); } catch {}
                                   try {
-                                    const editor = (typeof win.GetCurrentEditor === "function")
-                                      ? win.GetCurrentEditor()
-                                      : (win.gMsgCompose && win.gMsgCompose.editor) || null;
-                                    const doc = editor && editor.document;
-                                    if (doc && doc.body) {
-                                      const safe = String(body || "")
-                                        .replace(/&/g, "&amp;")
-                                        .replace(/</g, "&lt;")
-                                        .replace(/>/g, "&gt;")
-                                        .replace(/\n/g, "<br>");
-                                      doc.body.insertAdjacentHTML("afterbegin", `<p>${safe}</p><p><br></p>`);
+                                    const wu = win.windowUtils || win
+                                      .QueryInterface(Ci.nsIInterfaceRequestor)
+                                      .getInterface(Ci.nsIDOMWindowUtils);
+                                    if (wu && typeof wu.sendKeyEvent === "function") {
+                                      const CTRL = 1;
+                                      wu.sendKeyEvent("keydown", 87, 0, CTRL);
+                                      wu.sendKeyEvent("keyup", 87, 0, CTRL);
                                     }
                                   } catch {}
 
-                                  // Close compose.
-                                  const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                  _pendingTimers.add(tClose);
-                                  tClose.init(
-                                    {
-                                      notify: () => {
-                                        try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
-                                        try { if (!win.closed) win.close(); } catch {}
-                                        try {
-                                          const wu = win.windowUtils || win
-                                            .QueryInterface(Ci.nsIInterfaceRequestor)
-                                            .getInterface(Ci.nsIDOMWindowUtils);
-                                          if (wu && typeof wu.sendKeyEvent === "function") {
-                                            const CTRL = 1;
-                                            wu.sendKeyEvent("keydown", 87, 0, CTRL);
-                                            wu.sendKeyEvent("keyup", 87, 0, CTRL);
-                                          }
-                                        } catch {}
+                                  try { Services.ww.unregisterNotification(composeObserver); } catch {}
 
-                                        try { Services.ww.unregisterNotification(composeObserver); } catch {}
+                                  // Keep dialog observer alive a bit longer.
+                                  schedule(25000, () => {
+                                    try { Services.ww.unregisterNotification(dialogObserver); } catch {}
+                                    try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
+                                  });
+                                });
+                              },
+                            };
 
-                                        const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                                        _pendingTimers.add(t);
-                                        t.init(
-                                          {
-                                            notify: () => {
-                                              try { Services.ww.unregisterNotification(dialogObserver); } catch {}
-                                              try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
-                                              try { _pendingTimers.delete(t); } catch {}
-                                            },
-                                          },
-                                          25000,
-                                          Ci.nsITimer.TYPE_ONE_SHOT
-                                        );
+                            Services.tm.dispatchToMainThread(poll);
+                          },
+                        };
 
-                                        try { _pendingTimers.delete(tClose); } catch {}
-                                      },
-                                    },
-                                    1200,
-                                    Ci.nsITimer.TYPE_ONE_SHOT
-                                  );
-                                },
-                              };
-
-                              Services.tm.dispatchToMainThread(poll);
-                            },
-                          };
-
-                          Services.tm.dispatchToMainThread(runnable);
-                        } catch {
-                          try { Services.ww.unregisterNotification(composeObserver); } catch {}
-                        }
+                        Services.tm.dispatchToMainThread(runnable);
                       };
 
-                      // Multiple hooks + timed fallbacks
-                      try {
-                        if (win.document && win.document.readyState === "complete") {
-                          onComposeReady();
-                        } else {
-                          win.addEventListener("DOMContentLoaded", onComposeReady, { once: true });
-                          win.addEventListener("load", onComposeReady, { once: true });
-                        }
-                      } catch {}
+                      // Try immediately + repeated attempts (independent of load events).
+                      tryRun();
+                      schedule(1000, tryRun);
+                      schedule(3000, tryRun);
+                      schedule(6000, tryRun);
 
-                      for (const ms of [1000, 3000, 6000]) {
-                        const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                        _pendingTimers.add(t);
-                        t.init({ notify: () => { try { _pendingTimers.delete(t); } catch {} onComposeReady(); } }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
-                      }
-
-
-                        // If load already fired, run immediately.
-                        try {
-                          if (win.document && win.document.readyState === "complete") {
-                            onComposeReady();
-                          } else {
-                            win.addEventListener("load", onComposeReady, { once: true });
-                          }
-                        } catch {
-                          // best effort
-                        }
+                      // Also attach listeners (best-effort).
+                      try { win.addEventListener("DOMContentLoaded", tryRun, { once: true }); } catch {}
+                      try { win.addEventListener("load", tryRun, { once: true }); } catch {}
                     },
                   };
 
