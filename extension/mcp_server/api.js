@@ -153,7 +153,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "replyToMessageDraft",
         title: "Reply to Message (Save Draft)",
-        description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync). Supports idempotency to prevent duplicates.",
+        description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync). Includes quoted original message by default; supports idempotency to prevent duplicates.",
         inputSchema: {
           type: "object",
           properties: {
@@ -162,7 +162,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Reply body text" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
-            idempotencyKey: { type: "string", description: "Optional stable key to avoid creating duplicate reply drafts on retries" }
+            idempotencyKey: { type: "string", description: "Optional stable key to avoid creating duplicate reply drafts on retries" },
+            includeQuotedOriginal: { type: "boolean", description: "Whether to include quoted original message at bottom (default: true)" }
           },
           required: ["messageId", "folderPath", "body"]
         }
@@ -710,6 +711,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n/g, "\r\n");
             }
 
+            function _quotePlainText(text) {
+              const t = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+              return t
+                .split("\n")
+                .map((line) => `> ${line}`)
+                .join("\r\n");
+            }
+
+            function _formatReplyQuote(msg) {
+              // msg should be the getMessage() result shape.
+              const dateStr = msg.date ? new Date(msg.date).toLocaleString("en-US") : "";
+              const author = msg.author || "";
+              const header = dateStr
+                ? `On ${dateStr}, ${author} wrote:`
+                : `${author} wrote:`;
+
+              const original = msg.bodyText || msg.body || "";
+              return header + "\r\n" + _quotePlainText(original);
+            }
+
             function _simpleHash32Hex(str) {
               // Deterministic non-crypto hash for idempotency.
               let h = 2166136261;
@@ -1102,7 +1123,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml, idempotencyKey) {
+            async function replyToMessageDraft(messageId, folderPath, body, replyAll, isHtml, idempotencyKey, includeQuotedOriginal = true) {
               try {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
                 if (!folder) {
@@ -1183,8 +1204,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Drafts folder not found: ${draftsURI}` };
                 }
 
+                let finalBody = body || "";
+                if (includeQuotedOriginal) {
+                  try {
+                    const orig = await getMessage(messageId, folderPath);
+                    if (!orig || orig.error) {
+                      // ignore
+                    } else {
+                      finalBody = `${finalBody}\r\n\r\n${_formatReplyQuote(orig)}`;
+                    }
+                  } catch {
+                    // ignore
+                  }
+                }
+
                 // Duplicate prevention: deterministic Message-ID based on original message-id + body hash
-                const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${composeFields.to}|${composeFields.subject}|${body}`)}`;
+                const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${composeFields.to}|${composeFields.subject}|${finalBody}`)}`;
 
                 // Save reply draft by appending an RFC822 message directly into the identity's Drafts folder.
                 const { rfc822, messageId: draftMessageId } = _makeRfc822Draft({
@@ -1192,7 +1227,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   to: composeFields.to || "",
                   cc: composeFields.cc || "",
                   subject: composeFields.subject || "",
-                  body: body || "",
+                  body: finalBody,
                   inReplyTo: msgHdr.messageId,
                   references: composeFields.references || "",
                   idempotencyKey: key,
@@ -1348,7 +1383,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "replyToMessage":
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
                 case "replyToMessageDraft":
-                  return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey);
+                  return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.idempotencyKey, args.includeQuotedOriginal);
                 case "listLatestMessages":
                   return listLatestMessages(args.folderPath, args.limit);
                 case "deleteMessages":
