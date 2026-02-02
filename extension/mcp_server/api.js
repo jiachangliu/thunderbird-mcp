@@ -1544,19 +1544,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             if (!href.includes("messengercompose")) return;
 
                             // Wait a bit for quote insertion.
-                            const schedule = (ms, fn) => {
-                              Services.tm.dispatchToMainThread({ run: () => {
-                                try {
-                                  // crude delay loop
-                                  const start = Date.now();
-                                  while (Date.now() - start < ms) {}
-                                  fn();
-                                } catch {}
-                              }});
-                            };
+                            const sleep = (ms) => new Promise((resolve2) => {
+                              try {
+                                const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                t.initWithCallback({ notify: () => resolve2() }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+                              } catch {
+                                // Fallback: next tick
+                                Services.tm.dispatchToMainThread({ run: () => resolve2() });
+                              }
+                            });
 
-                            schedule(400, () => {
+                            (async () => {
+                              await sleep(600);
                               const inserted = _insertTextAtTopOfCompose(win, plainTextBody);
+
                               // Save as draft via native command.
                               try {
                                 if (typeof win.goDoCommand === "function") {
@@ -1564,15 +1565,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 }
                               } catch {}
 
-                              // Give TB a moment, then optionally close.
-                              schedule(600, () => {
-                                if (closeAfterSave) {
-                                  try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
-                                  try { if (!win.closed) win.close(); } catch {}
-                                }
-                                finish({ ok: true, inserted });
-                              });
-                            });
+                              await sleep(1200);
+
+                              if (closeAfterSave) {
+                                try { if (typeof win.goDoCommand === "function") win.goDoCommand("cmd_close"); } catch {}
+                                try { if (!win.closed) win.close(); } catch {}
+                              }
+
+                              finish({ ok: true, inserted });
+                            })().catch((e) => finish({ error: String(e) }));
                           } catch (e) {
                             finish({ error: e.toString() });
                           }
@@ -1585,12 +1586,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
                   // Safety timeout.
-                  Services.tm.dispatchToMainThread({ run: () => {
-                    // ~10s safety
-                    const start = Date.now();
-                    while (Date.now() - start < 10000) {}
-                    if (!done) finish({ error: "Timeout waiting for compose window" });
-                  }});
+                  try {
+                    const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                    t.initWithCallback({ notify: () => { if (!done) finish({ error: "Timeout waiting for compose window" }); } }, 15000, Ci.nsITimer.TYPE_ONE_SHOT);
+                  } catch {
+                    // fallback: no-op
+                  }
                 });
               } catch (e) {
                 return { error: e.toString() };
