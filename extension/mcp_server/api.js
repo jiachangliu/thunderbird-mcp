@@ -228,6 +228,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         }
       },
       {
+        name: "reviseDraftInPlaceNativeEditor",
+        title: "Revise Draft In Place (native editor)",
+        description: "Open an existing draft in a native compose tab/window, replace the body using Thunderbird editor APIs, then save. Attempts to avoid duplicates by deleting the previous draft if Thunderbird creates a new one.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "RFC822 Message-ID header of the existing draft" },
+            folderPath: { type: "string", description: "Folder URI where the draft lives (imap://.../Drafts)" },
+            plainTextBody: { type: "string", description: "New full body for the draft (plain text)." },
+            closeAfterSave: { type: "boolean", description: "Close compose tab/window after saving (default true)" }
+          },
+          required: ["messageId", "folderPath", "plainTextBody"]
+        }
+      },
+      {
         name: "replyToMessageDraftComposeApi",
         title: "Reply to Message (Save Draft via compose API)",
         description: "Create a reply draft using Thunderbird's WebExtension compose API (messages.query + compose.beginReply + compose.setComposeDetails + compose.saveMessage). This should preserve native reply quoting and produce a real Draft without OS-level UI automation.",
@@ -1495,6 +1510,189 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function _replaceBodyWithPlainText(win, text) {
+              // Replace the entire compose body with the provided plain text.
+              try {
+                if (!win) return false;
+                const t = String(text || "");
+
+                let editor = null;
+                try { if (win.gMsgCompose && win.gMsgCompose.editor) editor = win.gMsgCompose.editor; } catch {}
+                try { if (!editor && typeof win.GetCurrentEditor === "function") editor = win.GetCurrentEditor(); } catch {}
+                if (!editor) return false;
+
+                // Select all + delete.
+                try {
+                  if (typeof editor.selectAll === "function") editor.selectAll();
+                } catch {}
+                try {
+                  if (typeof editor.deleteSelection === "function") {
+                    // "next" is safe enough for our use.
+                    editor.deleteSelection("next", "strip");
+                  }
+                } catch {}
+
+                // Insert new content.
+                try {
+                  if (typeof editor.insertText === "function") {
+                    editor.insertText(t + "\n");
+                    return true;
+                  }
+                } catch {}
+
+                try {
+                  const plain = editor.QueryInterface(Ci.nsIPlaintextEditor);
+                  plain.insertText(t + "\n");
+                  return true;
+                } catch {}
+
+                return false;
+              } catch {
+                return false;
+              }
+            }
+
+            function _sleep(ms) {
+              return new Promise((resolve) => {
+                try {
+                  const t = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  t.initWithCallback({ notify: () => resolve() }, ms, Ci.nsITimer.TYPE_ONE_SHOT);
+                } catch {
+                  Services.tm.dispatchToMainThread({ run: () => resolve() });
+                }
+              });
+            }
+
+            function _snapshotComposeTabs() {
+              // Returns a set of compose tab identifiers + light metadata.
+              const out = [];
+              try {
+                const en = Services.wm.getEnumerator("mail:3pane");
+                while (en.hasMoreElements()) {
+                  const w = en.getNext();
+                  const tabmail = w.document && w.document.getElementById && w.document.getElementById("tabmail");
+                  if (!tabmail || !Array.isArray(tabmail.tabInfo)) continue;
+                  for (const ti of tabmail.tabInfo) {
+                    try {
+                      const browser = ti.browser || ti.linkedBrowser;
+                      const cw = browser && browser.contentWindow;
+                      const href = cw && cw.location && cw.location.href;
+                      if (!href || !String(href).includes("messengercompose")) continue;
+                      const subject = (cw && cw.gMsgCompose && cw.gMsgCompose.compFields && cw.gMsgCompose.compFields.subject) || "";
+                      out.push({ w, tabmail, ti, cw, href: String(href), subject: String(subject || "") });
+                    } catch {}
+                  }
+                }
+              } catch {}
+              return out;
+            }
+
+            function _pickNewComposeTab(before, after, wantSubject) {
+              // Heuristic: choose a compose tab that wasn't present in the 'before' snapshot.
+              const beforeSet = new Set((before || []).map(x => String(x.href) + "|" + String(x.subject)));
+              const candidates = (after || []).filter(x => !beforeSet.has(String(x.href) + "|" + String(x.subject)));
+              const all = candidates.length ? candidates : (after || []);
+              if (wantSubject) {
+                const exact = all.find(x => (x.subject || "") === wantSubject);
+                if (exact) return exact;
+              }
+              return all[0] || null;
+            }
+
+            async function reviseDraftInPlaceNativeEditor(messageId, folderPath, plainTextBody, closeAfterSave = true) {
+              // Best-effort: open the existing draft, replace body, save.
+              // If TB creates a new draft item on save, delete the old one to avoid duplicates.
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) return { error: `Folder not found: ${folderPath}` };
+                const db = folder.msgDatabase;
+                if (!db) return { error: "Could not access folder database" };
+
+                let msgHdr = null;
+                for (const hdr of db.enumerateMessages()) {
+                  if (hdr.messageId === messageId) { msgHdr = hdr; break; }
+                }
+                if (!msgHdr) return { error: `Draft not found: ${messageId}` };
+
+                const wantedSubject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toString();
+                const before = _snapshotComposeTabs();
+                const startedAt = Date.now();
+
+                const identity = getIdentityForFolder(folder);
+                if (!identity) return { error: "Could not resolve identity" };
+
+                const msgComposeService = Cc["@mozilla.org/messengercompose;1"].getService(Ci.nsIMsgComposeService);
+                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"].createInstance(Ci.nsIMsgComposeParams);
+                msgComposeParams.type = Ci.nsIMsgCompType.Draft;
+                msgComposeParams.format = Ci.nsIMsgCompFormat.Default;
+                msgComposeParams.identity = identity;
+                msgComposeParams.originalMsgURI = msgHdr.folder.getUriForMsg(msgHdr);
+
+                // Open the draft for editing.
+                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                // Wait for compose tab/window to appear.
+                let found = null;
+                for (let i = 0; i < 80; i++) {
+                  const after = _snapshotComposeTabs();
+                  found = _pickNewComposeTab(before, after, wantedSubject);
+                  if (found && found.cw && found.cw.gMsgCompose) break;
+                  await _sleep(250);
+                }
+                if (!found || !found.cw) return { error: "Timeout locating compose tab for draft" };
+
+                const replaced = _replaceBodyWithPlainText(found.cw, plainTextBody);
+
+                try { if (typeof found.cw.goDoCommand === "function") found.cw.goDoCommand("cmd_saveAsDraft"); } catch {}
+                await _sleep(2500);
+
+                // Detect duplicates: if another draft with same subject exists and is newer than start.
+                let newestSameSubject = null;
+                try {
+                  const db2 = folder.msgDatabase;
+                  for (const hdr of db2.enumerateMessages()) {
+                    try {
+                      const subj = (hdr.mime2DecodedSubject || hdr.subject || "").toString();
+                      if (subj !== wantedSubject) continue;
+                      const dt = hdr.dateInSeconds ? hdr.dateInSeconds * 1000 : 0;
+                      if (dt >= startedAt - 2000) {
+                        if (!newestSameSubject || dt > (newestSameSubject.dateInSeconds * 1000)) {
+                          newestSameSubject = hdr;
+                        }
+                      }
+                    } catch {}
+                  }
+                } catch {}
+
+                let deletedOld = false;
+                let newMessageId = messageId;
+                try {
+                  if (newestSameSubject && newestSameSubject.messageId && newestSameSubject.messageId !== messageId) {
+                    // Delete the original draft header to avoid duplicates.
+                    try {
+                      msgHdr.folder.deleteMessages([msgHdr], null, true, false, null, false);
+                      deletedOld = true;
+                      newMessageId = newestSameSubject.messageId;
+                    } catch {}
+                  }
+                } catch {}
+
+                if (closeAfterSave) {
+                  try {
+                    if (found.tabmail && typeof found.tabmail.closeTab === "function" && found.ti) {
+                      found.tabmail.closeTab(found.ti);
+                    } else if (found.cw && !found.cw.closed) {
+                      found.cw.close();
+                    }
+                  } catch {}
+                }
+
+                return { ok: true, replaced, oldMessageId: messageId, messageId: newMessageId, deletedOld };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function replyToMessageDraftNativeEditor(messageId, folderPath, replyAll, plainTextBody, closeAfterSave = true) {
               try {
                 // Open reply using native WebExtension compose API (so TB creates the quote/threading).
@@ -2648,6 +2846,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await replyToMessageDraftComposeApi(args.messageId, args.folderPath, args.replyAll, args.plainTextBody, args.htmlBody, args.includeQuotedOriginal, args.closeAfterSave);
                 case "replyToMessageDraftNativeEditor":
                   return await replyToMessageDraftNativeEditor(args.messageId, args.folderPath, args.replyAll, args.plainTextBody, args.closeAfterSave);
+                case "reviseDraftInPlaceNativeEditor":
+                  return await reviseDraftInPlaceNativeEditor(args.messageId, args.folderPath, args.plainTextBody, args.closeAfterSave);
                 case "debugContext":
                   return debugContext();
                 case "debugMessagesList":
