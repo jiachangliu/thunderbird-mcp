@@ -779,29 +779,60 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 .slice(0, 120);
             }
 
-            function _makeRfc822Draft({ from, to, cc, subject, body, inReplyTo, references, idempotencyKey }) {
+            function _getEmailDomain(identity) {
+              try {
+                const email = identity && identity.email ? String(identity.email) : "";
+                const parts = email.split("@");
+                return parts.length === 2 ? parts[1] : "local";
+              } catch {
+                return "local";
+              }
+            }
+
+            function _makeRfc822Draft({ from, to, cc, subject, body, inReplyTo, references, idempotencyKey, identityKey, fcc, isHtml }) {
               const headers = [];
-              headers.push(`From: ${from}`);
+
+              // Thunderbird-created drafts include these (helps mimic behavior).
+              headers.push("X-Mozilla-Status: 0001");
+              headers.push("X-Mozilla-Status2: 00000000");
+
+              if (from) headers.push(`From: ${from}`);
               if (to) headers.push(`To: ${to}`);
               if (cc) headers.push(`Cc: ${cc}`);
               if (subject !== undefined) headers.push(`Subject: ${subject || ""}`);
-              headers.push(`Date: ${new Date().toUTCString()}`);
+              headers.push(`Date: ${new Date().toString()}`);
+              headers.push("User-Agent: Mozilla Thunderbird");
+              headers.push("Content-Language: en-US");
 
               const token = idempotencyKey ? _sanitizeMessageIdToken(idempotencyKey) : null;
+              const domain = _getEmailDomain({ email: (from || "").match(/<([^>]+)>/)?.[1] || "" }) || "local";
               const messageId = token
-                ? `tb-mcp-draft-${token}@local`
-                : `tb-mcp-draft-${Date.now()}@local`;
+                ? `tb-mcp-draft-${token}@${domain}`
+                : `tb-mcp-draft-${Date.now()}@${domain}`;
               headers.push(`Message-ID: <${messageId}>`);
 
-              if (inReplyTo) headers.push(`In-Reply-To: <${inReplyTo.replace(/[<>]/g, "")}>`);
               if (references) headers.push(`References: ${references}`);
-              headers.push("MIME-Version: 1.0");
-              headers.push("Content-Type: text/plain; charset=UTF-8");
-              headers.push("Content-Transfer-Encoding: 8bit");
-              // Mark as a draft for some servers/clients.
-              headers.push("X-Mozilla-Draft-Info: internal/draft");
+              if (inReplyTo) headers.push(`In-Reply-To: <${inReplyTo.replace(/[<>]/g, "")}>`);
 
-              return { rfc822: headers.join("\r\n") + "\r\n\r\n" + _normalizeCRLF(body || "") + "\r\n", messageId };
+              headers.push("MIME-Version: 1.0");
+
+              // Draft metadata similar to TB
+              headers.push("X-Mozilla-Draft-Info: internal/draft; vcard=0; receipt=0; DSN=0; uuencode=0; attachmentreminder=0; deliveryformat=0");
+              if (identityKey) headers.push(`X-Identity-Key: ${identityKey}`);
+              if (fcc) headers.push(`Fcc: ${fcc}`);
+
+              if (isHtml) {
+                headers.push('Content-Type: text/html; charset="UTF-8"');
+              } else {
+                headers.push("Content-Type: text/plain; charset=UTF-8");
+              }
+              headers.push("Content-Transfer-Encoding: 8bit");
+
+              const payload = isHtml
+                ? String(body || "")
+                : _normalizeCRLF(body || "");
+
+              return { rfc822: headers.join("\r\n") + "\r\n\r\n" + payload + "\r\n", messageId };
             }
 
             function _writeStringToTempFileUtf8(filenamePrefix, content) {
@@ -934,6 +965,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   subject: subject || "",
                   body: body || "",
                   idempotencyKey: key,
+                  identityKey: identity.key,
+                  fcc: "",
+                  isHtml: false,
                 });
 
                 // Duplicate prevention: prevent immediate retries from creating multiple drafts.
@@ -1232,13 +1266,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 let finalBody = body || "";
+                let finalBodyHtml = "";
+
                 if (includeQuotedOriginal) {
                   try {
                     const orig = await getMessage(messageId, folderPath);
                     if (!orig || orig.error) {
                       // ignore
                     } else {
+                      // Plaintext fallback quote
                       finalBody = `${finalBody}\r\n\r\n${_formatReplyQuote(orig)}`;
+
+                      // HTML quote (Thunderbird/OWA-friendly)
+                      const dateStr = orig.date ? new Date(orig.date).toLocaleString("en-US") : "";
+                      const author = orig.author || "";
+                      const citeMid = orig.id ? `mid:${orig.id}` : "";
+                      const origHtml = orig.bodyHtml || "";
+
+                      const replyHtml = `<p>${String(body || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\n/g,"<br>")}</p>`;
+                      const citePrefix = `<div class=\"moz-cite-prefix\">On ${dateStr}, ${author} wrote:<br></div>`;
+                      const quoted = origHtml
+                        ? `<blockquote type=\"cite\" cite=\"${citeMid}\">${origHtml}</blockquote>`
+                        : `<blockquote type=\"cite\" cite=\"${citeMid}\"><pre>${String(orig.bodyText || orig.body || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</pre></blockquote>`;
+
+                      finalBodyHtml = `<!DOCTYPE html><html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\"></head><body>${replyHtml}${citePrefix}${quoted}</body></html>`;
                     }
                   } catch {
                     // ignore
@@ -1246,7 +1297,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // Duplicate prevention: deterministic Message-ID based on original message-id + body hash
-                const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${composeFields.to}|${composeFields.subject}|${finalBody}`)}`;
+                const key = idempotencyKey || `reply-${_simpleHash32Hex(`${msgHdr.messageId}|${composeFields.to}|${composeFields.subject}|${finalBodyHtml || finalBody}`)}`;
 
                 // Save reply draft by appending an RFC822 message directly into the identity's Drafts folder.
                 const { rfc822, messageId: draftMessageId } = _makeRfc822Draft({
@@ -1254,10 +1305,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   to: composeFields.to || "",
                   cc: composeFields.cc || "",
                   subject: composeFields.subject || "",
-                  body: finalBody,
+                  body: finalBodyHtml || finalBody,
                   inReplyTo: msgHdr.messageId,
                   references: composeFields.references || "",
                   idempotencyKey: key,
+                  identityKey: identity ? identity.key : "",
+                  fcc: "",
+                  isHtml: !!finalBodyHtml,
                 });
 
                 if (_pendingDraftMessageIds.has(draftMessageId)) {
