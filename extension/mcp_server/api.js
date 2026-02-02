@@ -1529,6 +1529,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                       return;
                                     }
 
+                                    // Insert reply text at the top by DOM manipulation (more reliable than editor.insertText).
+                                    try {
+                                      const editor = (typeof win.GetCurrentEditor === "function")
+                                        ? win.GetCurrentEditor()
+                                        : (win.gMsgCompose && win.gMsgCompose.editor) || null;
+                                      const doc = editor && editor.document;
+                                      if (doc && doc.body) {
+                                        const safe = String(body || "")
+                                          .replace(/&/g, "&amp;")
+                                          .replace(/</g, "&lt;")
+                                          .replace(/>/g, "&gt;")
+                                          .replace(/\n/g, "<br>");
+                                        doc.body.insertAdjacentHTML("afterbegin", `<p>${safe}</p><p><br></p>`);
+                                      }
+                                    } catch {}
+
                                     // Close compose window -> triggers "Save draft?" prompt -> our dialogObserver clicks Save.
                                     const tClose = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                                     _pendingTimers.add(tClose);
@@ -1560,7 +1576,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                           try { _pendingTimers.delete(tClose); } catch {}
                                         },
                                       },
-                                      500,
+                                      800,
                                       Ci.nsITimer.TYPE_ONE_SHOT
                                     );
                                   },
