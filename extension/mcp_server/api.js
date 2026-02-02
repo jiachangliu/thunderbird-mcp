@@ -1561,7 +1561,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function _replaceTopTextPreserveQuote(win, text) {
               // Replace only the top part of the body, keeping the quoted original (first blockquote[type=cite]).
-              // If we can't find a quote block, fall back to full replace.
+              // Implemented by DOM surgery (more reliable than selection-based deletion across TB versions).
               try {
                 if (!win) return false;
                 const t = String(text || "");
@@ -1574,57 +1574,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const doc = editor.document || (win.document || null);
                 if (!doc) return _replaceBodyWithPlainText(win, text);
 
-                // In TB compose, the quote is usually a blockquote in the editor document.
                 let quote = null;
                 try {
                   quote = doc.querySelector && doc.querySelector('blockquote[type="cite"], blockquote[cite], blockquote');
                 } catch {}
-                if (!quote) {
-                  return _replaceBodyWithPlainText(win, text);
-                }
+                if (!quote) return _replaceBodyWithPlainText(win, text);
 
                 const body = doc.body || doc.documentElement;
                 if (!body) return _replaceBodyWithPlainText(win, text);
 
-                const rng = doc.createRange();
-                // Start from beginning of body content.
-                try { rng.setStart(body, 0); } catch { return _replaceBodyWithPlainText(win, text); }
-                // End just before quote.
-                try { rng.setEndBefore(quote); } catch { return _replaceBodyWithPlainText(win, text); }
-
-                const sel = editor.selection;
-                if (!sel) return _replaceBodyWithPlainText(win, text);
-
+                // Remove everything before the quote block.
                 try {
-                  sel.removeAllRanges();
-                  sel.addRange(rng);
-                } catch {
-                  return _replaceBodyWithPlainText(win, text);
-                }
-
-                try {
-                  if (typeof editor.deleteSelection === "function") {
-                    editor.deleteSelection("next", "strip");
+                  while (body.firstChild && body.firstChild !== quote) {
+                    body.removeChild(body.firstChild);
                   }
-                } catch {
-                  // ignore
-                }
-
-                // Insert new top text.
-                try {
-                  if (typeof editor.insertText === "function") {
-                    editor.insertText(t + "\n\n");
-                    return true;
+                  // Sometimes quote isn't a direct child (e.g., preceded by moz-cite-prefix div).
+                  // In that case, remove nodes until we see the quote somewhere in the remaining subtree.
+                  let safety = 0;
+                  while (safety++ < 50) {
+                    const hasQuote = !!(body.querySelector && body.querySelector('blockquote[type="cite"], blockquote[cite], blockquote'));
+                    if (hasQuote) break;
+                    if (!body.firstChild) break;
+                    body.removeChild(body.firstChild);
                   }
                 } catch {}
 
-                try {
-                  const plain = editor.QueryInterface(Ci.nsIPlaintextEditor);
-                  plain.insertText(t + "\n\n");
-                  return true;
-                } catch {}
+                // Re-find quote after removals.
+                try { quote = body.querySelector('blockquote[type="cite"], blockquote[cite], blockquote'); } catch {}
+                if (!quote) return _replaceBodyWithPlainText(win, text);
 
-                return false;
+                // Insert a fresh <p> with the new text, preserving line breaks.
+                const p = doc.createElement("p");
+                const lines = t.split(/\r?\n/);
+                for (let i = 0; i < lines.length; i++) {
+                  p.appendChild(doc.createTextNode(lines[i]));
+                  if (i !== lines.length - 1) p.appendChild(doc.createElement("br"));
+                }
+                // Add an extra blank line between top text and quote.
+                p.appendChild(doc.createElement("br"));
+                p.appendChild(doc.createElement("br"));
+
+                body.insertBefore(p, quote);
+
+                return true;
               } catch {
                 return false;
               }
