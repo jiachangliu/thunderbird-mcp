@@ -1416,28 +1416,54 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             // Common dialog window for confirm-save.
                             if (!url.includes("commonDialog")) return;
 
-                            // Choose the button whose label contains "Save".
+                            // Click the button whose label contains "Save" OR whose accessKey is "S".
+                            // (The prompt shows Discard/Cancel/Save with S underlined.)
                             try {
                               const dlg = win.document.querySelector("dialog");
                               const tryButtons = ["accept", "extra1", "extra2", "cancel"];
                               let clicked = false;
+
+                              const clickBtnIfSave = (btn) => {
+                                if (!btn) return false;
+                                const label = (btn.getAttribute("label") || btn.label || btn.textContent || "").trim();
+                                const access = (btn.getAttribute("accesskey") || btn.accessKey || "").trim();
+                                if (/^s$/i.test(access) || /save/i.test(label)) {
+                                  btn.click();
+                                  return true;
+                                }
+                                return false;
+                              };
+
                               if (dlg && typeof dlg.getButton === "function") {
                                 for (const which of tryButtons) {
                                   const btn = dlg.getButton(which);
-                                  const label = btn ? (btn.getAttribute("label") || btn.label || "") : "";
-                                  if (btn && /save/i.test(label)) {
-                                    btn.click();
+                                  if (clickBtnIfSave(btn)) {
                                     clicked = true;
                                     break;
                                   }
                                 }
                               }
+
                               if (!clicked) {
-                                // Fallback to acceptDialog (may be Save depending on dialog wiring).
-                                win.document.documentElement.acceptDialog();
+                                // Fallback: scan all buttons
+                                const buttons = Array.from(win.document.querySelectorAll("button"));
+                                for (const btn of buttons) {
+                                  if (clickBtnIfSave(btn)) {
+                                    clicked = true;
+                                    break;
+                                  }
+                                }
+                              }
+
+                              if (!clicked) {
+                                // Last resort: send the 'S' key.
+                                try {
+                                  const ev = new win.KeyboardEvent("keydown", { key: "s", code: "KeyS" });
+                                  win.document.dispatchEvent(ev);
+                                } catch {}
                               }
                             } catch {
-                              try { win.document.documentElement.acceptDialog(); } catch {}
+                              // Do nothing; better to not accidentally discard.
                             }
                           } catch {}
                         },
