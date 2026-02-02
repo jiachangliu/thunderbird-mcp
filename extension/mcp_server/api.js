@@ -152,7 +152,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "replyToMessageDraft",
         title: "Reply to Message (Save Draft)",
-        description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync) without opening a compose window",
+        description: "Create a reply draft saved to the account Drafts folder (for Outlook cloud sync). Implementation opens compose briefly, triggers Save Draft, then closes.",
         inputSchema: {
           type: "object",
           properties: {
@@ -163,6 +163,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
           },
           required: ["messageId", "folderPath", "body"]
+        }
+      },
+      {
+        name: "listLatestMessages",
+        title: "List Latest Messages (by folder)",
+        description: "List the most recent messages in a folder WITHOUT changing any state. Useful for Drafts verification.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (e.g., imap://.../Drafts)" },
+            limit: { type: "number", description: "Max messages to return (default 20, max 100)" }
+          },
+          required: ["folderPath"]
         }
       },
       {
@@ -715,19 +728,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           const url = String(win.location);
                           if (!url.includes("messengercompose")) return;
 
-                          // Save draft
-                          win.goDoCommand("cmd_saveAsDraft");
-
-                          // Close shortly after
-                          const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                          timer.init(
+                          // Save draft after a short delay to ensure the editor + commands are ready.
+                          const t1 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                          t1.init(
                             {
                               notify: () => {
-                                try { win.close(); } catch {}
-                                try { Services.ww.unregisterNotification(observer); } catch {}
+                                try {
+                                  win.goDoCommand("cmd_saveAsDraft");
+                                } catch (e) {
+                                  // ignore
+                                }
+
+                                // Give IMAP/Outlook time to enqueue the draft, then close.
+                                const t2 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                t2.init(
+                                  {
+                                    notify: () => {
+                                      try { win.close(); } catch {}
+                                      try { Services.ww.unregisterNotification(observer); } catch {}
+                                    },
+                                  },
+                                  6000,
+                                  Ci.nsITimer.TYPE_ONE_SHOT
+                                );
                               },
                             },
-                            1200,
+                            1500,
                             Ci.nsITimer.TYPE_ONE_SHOT
                           );
                         } catch {
@@ -1003,17 +1029,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           const url = String(win.location);
                           if (!url.includes("messengercompose")) return;
 
-                          win.goDoCommand("cmd_saveAsDraft");
-
-                          const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                          timer.init(
+                          const t1 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                          t1.init(
                             {
                               notify: () => {
-                                try { win.close(); } catch {}
-                                try { Services.ww.unregisterNotification(observer); } catch {}
+                                try {
+                                  win.goDoCommand("cmd_saveAsDraft");
+                                } catch (e) {
+                                  // ignore
+                                }
+
+                                const t2 = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                                t2.init(
+                                  {
+                                    notify: () => {
+                                      try { win.close(); } catch {}
+                                      try { Services.ww.unregisterNotification(observer); } catch {}
+                                    },
+                                  },
+                                  6000,
+                                  Ci.nsITimer.TYPE_ONE_SHOT
+                                );
                               },
                             },
-                            1200,
+                            1500,
                             Ci.nsITimer.TYPE_ONE_SHOT
                           );
                         } catch {
@@ -1029,6 +1068,48 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
                 return { success: true, message: "Draft window opened, save triggered, will close automatically", messageId, folderPath };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function listLatestMessages(folderPath, limit) {
+              try {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                const db = folder.msgDatabase;
+                if (!db) {
+                  return { error: "Could not access folder database" };
+                }
+
+                const max = Math.min(Math.max(parseInt(limit || 20, 10) || 20, 1), 100);
+                const msgs = [];
+
+                // Collect all headers then sort by date descending.
+                const all = [];
+                for (const hdr of db.enumerateMessages()) {
+                  all.push(hdr);
+                }
+                all.sort((a, b) => (b.date || 0) - (a.date || 0));
+
+                for (const hdr of all.slice(0, max)) {
+                  msgs.push({
+                    id: hdr.messageId,
+                    subject: hdr.mime2DecodedSubject || hdr.subject,
+                    author: hdr.mime2DecodedAuthor || hdr.author,
+                    recipients: hdr.mime2DecodedRecipients || hdr.recipients,
+                    date: hdr.date ? new Date(hdr.date / 1000).toISOString() : null,
+                    folder: folder.prettyName,
+                    folderPath: folder.URI,
+                    read: hdr.isRead,
+                    flagged: hdr.isFlagged,
+                  });
+                }
+
+                return { ok: true, folderPath: folder.URI, count: msgs.length, items: msgs };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -1058,6 +1139,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
                 case "replyToMessageDraft":
                   return replyToMessageDraft(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
+                case "listLatestMessages":
+                  return listLatestMessages(args.folderPath, args.limit);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
