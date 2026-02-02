@@ -84,7 +84,17 @@ if not obj.get("ok"):
 print(obj.get("messageId"))' <<<"$rev")
 
 # 5) Verify revised draft contains TOK2 and still contains quoted original snippet.
-raw2=$(curl -sS -m 60 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"getRawMessage","arguments":{"messageId":"'"$new_id"'","folderPath":"'"$DRAFTS"'"}}}')
+# IMAP sync can lag, so poll raw message for a short period.
+raw2=""
+for i in {1..20}; do
+  raw2=$(curl -sS -m 60 -X POST "$HOST" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"getRawMessage","arguments":{"messageId":"'"$new_id"'","folderPath":"'"$DRAFTS"'"}}}')
+  ok=$(python3 -c 'import json,re,sys; tok=sys.argv[1]; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); msg=json.loads(j["result"]["content"][0]["text"]); src=msg["source"]; body=src.split("\r\n\r\n",1)[1];
+print("YES" if tok in body else "NO")' "$TOK2" <<<"$raw2")
+  if [[ "$ok" == "YES" ]]; then
+    break
+  fi
+  sleep 2
+done
 
 python3 -c 'import json,re,sys; raw=sys.stdin.read(); raw=re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]","",raw); j=json.loads(raw); msg=json.loads(j["result"]["content"][0]["text"]); src=msg["source"]; body=src.split("\r\n\r\n",1)[1];
 assert "'"$TOK2"'" in body, "missing TOK2";
