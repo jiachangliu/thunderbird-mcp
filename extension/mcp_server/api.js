@@ -902,27 +902,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const file = _writeStringToTempFileUtf8("tb-mcp-draft", rfc822);
                 _pendingDraftMessageIds.add(messageId);
 
-                // Schedule copy async so the HTTP handler returns immediately (some backends can block the main thread).
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                _pendingTimers.add(timer);
-                timer.init(
-                  {
-                    notify: async () => {
-                      try {
-                        await _copyFileToFolderAsDraft(file, draftsFolder, 30000);
+                // Schedule copy async so the HTTP handler returns immediately.
+                // Use dispatchToMainThread instead of nsITimer (timers can be unreliable in this add-on context).
+                const runnable = {
+                  run: () => {
+                    _copyFileToFolderAsDraft(file, draftsFolder, 30000)
+                      .then(() => {
                         try { draftsFolder.updateFolder(null); } catch {}
                         try { Services.console.logStringMessage(`thunderbird-mcp: draft saved to ${draftsURI}`); } catch {}
-                      } catch (e) {
+                      })
+                      .catch((e) => {
                         try { Services.console.logStringMessage(`thunderbird-mcp: draft save failed: ${e}`); } catch {}
-                      } finally {
-                        try { _pendingTimers.delete(timer); } catch {}
+                      })
+                      .finally(() => {
                         try { _pendingDraftMessageIds.delete(messageId); } catch {}
-                      }
-                    },
+                        try { _pendingTimers.delete(runnable); } catch {}
+                      });
                   },
-                  0,
-                  Ci.nsITimer.TYPE_ONE_SHOT
-                );
+                };
+
+                _pendingTimers.add(runnable);
+                Services.tm.dispatchToMainThread(runnable);
 
                 return { success: true, message: "Draft save scheduled (backend copy)", draftsFolder: draftsURI, messageId };
               } catch (e) {
@@ -1210,26 +1210,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const file = _writeStringToTempFileUtf8("tb-mcp-reply-draft", rfc822);
                 _pendingDraftMessageIds.add(draftMessageId);
 
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                _pendingTimers.add(timer);
-                timer.init(
-                  {
-                    notify: async () => {
-                      try {
-                        await _copyFileToFolderAsDraft(file, draftsFolder, 30000);
+                const runnable = {
+                  run: () => {
+                    _copyFileToFolderAsDraft(file, draftsFolder, 30000)
+                      .then(() => {
                         try { draftsFolder.updateFolder(null); } catch {}
                         try { Services.console.logStringMessage(`thunderbird-mcp: reply draft saved to ${draftsURI}`); } catch {}
-                      } catch (e) {
+                      })
+                      .catch((e) => {
                         try { Services.console.logStringMessage(`thunderbird-mcp: reply draft save failed: ${e}`); } catch {}
-                      } finally {
-                        try { _pendingTimers.delete(timer); } catch {}
+                      })
+                      .finally(() => {
                         try { _pendingDraftMessageIds.delete(draftMessageId); } catch {}
-                      }
-                    },
+                        try { _pendingTimers.delete(runnable); } catch {}
+                      });
                   },
-                  0,
-                  Ci.nsITimer.TYPE_ONE_SHOT
-                );
+                };
+
+                _pendingTimers.add(runnable);
+                Services.tm.dispatchToMainThread(runnable);
 
                 return { success: true, message: "Reply draft save scheduled (backend copy)", messageId, folderPath, draftsFolder: draftsURI, draftMessageId };
               } catch (e) {
