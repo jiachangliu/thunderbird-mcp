@@ -1819,7 +1819,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   extensionKeys: context && context.extension ? Object.getOwnPropertyNames(context.extension) : [],
                   hasApiManager: !!(context && context.extension && context.extension.apiManager),
                   apiManagerKeys: context && context.extension && context.extension.apiManager ? Object.getOwnPropertyNames(context.extension.apiManager) : [],
+                  viewsType: (context && context.extension && context.extension.views) ? Object.prototype.toString.call(context.extension.views) : null,
+                  viewsCtor: (context && context.extension && context.extension.views && context.extension.views.constructor) ? context.extension.views.constructor.name : null,
+                  viewsIsArray: !!(context && context.extension && Array.isArray(context.extension.views)),
                   viewsCount: (context && context.extension && Array.isArray(context.extension.views)) ? context.extension.views.length : null,
+                  viewsKeys: (context && context.extension && context.extension.views) ? Object.getOwnPropertyNames(context.extension.views).slice(0,50) : [],
                 };
 
                 // Probe a few known paths.
