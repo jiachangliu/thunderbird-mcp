@@ -2066,33 +2066,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Could not find message in folder via messages.list/continueList for headerMessageId=${messageIdHeader}` };
                 }
 
-                const replyType = replyAll ? "replyToAll" : "replyToSender";
-                const tab = await composeApi.beginReply(msgId, replyType);
-                const tabId = tab && tab.id;
-
-                // Wait for Thunderbird to finish inserting the quoted original.
-                // If we set too early, Thunderbird may later overwrite.
-                let detailsBefore = null;
-                let details = null;
-
-                for (let i = 0; i < 40; i++) {
-                  details = await composeApi.getComposeDetails(tabId);
-                  if (!detailsBefore) detailsBefore = details;
-
-                  const b = (details && typeof details.body === "string") ? details.body : "";
-                  const pb = (details && typeof details.plainTextBody === "string") ? details.plainTextBody : "";
-
-                  if ((b && /<blockquote[^>]*type=\"cite\"/i.test(b)) || (pb && pb.includes("wrote:"))) {
-                    break;
-                  }
-                  await new Promise(r => Services.tm.dispatchToMainThread(() => r()));
-                }
-
-                const isPlain = !!(details && (details.isPlainText || typeof details.plainTextBody === "string"));
-                const existingBody = (details && typeof details.body === "string") ? details.body : "";
-                const existingPlain = (details && typeof details.plainTextBody === "string") ? details.plainTextBody : "";
-
-                // Build prefix
+                // Build prefix early so we can try to pass it directly to beginReply(details)
                 const plainPrefix = (typeof plainTextBody === "string") ? plainTextBody : "";
                 let htmlPrefix = "";
                 if (typeof htmlBody === "string" && htmlBody.trim()) {
@@ -2105,23 +2079,59 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   htmlPrefix = `<p>${esc(plainPrefix).replace(/\r\n/g, "\n").replace(/\n/g, "<br>")}</p>`;
                 }
 
-                // Update compose using the correct field.
-                if (isPlain && plainPrefix) {
-                  const newPlain = includeQuotedOriginal ? (plainPrefix + "\n\n" + existingPlain) : plainPrefix;
-                  await composeApi.setComposeDetails(tabId, { plainTextBody: newPlain });
-                } else {
-                  const newBody = includeQuotedOriginal ? (htmlPrefix + existingBody) : htmlPrefix;
-                  await composeApi.setComposeDetails(tabId, { body: newBody });
+                const replyType = replyAll ? "replyToAll" : "replyToSender";
+
+                // Prefer passing the body directly to beginReply(details). This tends to be applied by TB
+                // during compose initialization (and is less likely to be overwritten later).
+                const beginDetails = (plainPrefix && !htmlBody) ? { plainTextBody: plainPrefix } : (htmlPrefix ? { body: htmlPrefix } : undefined);
+                const tab = beginDetails ? await composeApi.beginReply(msgId, replyType, beginDetails) : await composeApi.beginReply(msgId, replyType);
+                const tabId = tab && tab.id;
+
+                // Wait for quote insertion and then verify whether our prefix stuck.
+                let detailsBefore = null;
+                let details = null;
+                for (let i = 0; i < 60; i++) {
+                  details = await composeApi.getComposeDetails(tabId);
+                  if (!detailsBefore) detailsBefore = details;
+
+                  const b = (details && typeof details.body === "string") ? details.body : "";
+                  const pb = (details && typeof details.plainTextBody === "string") ? details.plainTextBody : "";
+
+                  const quoteReady = (b && /<blockquote[^>]*type=\"cite\"/i.test(b)) || (pb && pb.includes("wrote:"));
+                  const prefixPresent = (plainPrefix && pb && pb.includes(plainPrefix.trim().slice(0, Math.min(20, plainPrefix.trim().length)))) ||
+                    (htmlPrefix && b && b.includes(htmlPrefix.replace(/\s+/g, " ").slice(0, 10)));
+
+                  if (quoteReady) {
+                    // If quote is ready but prefix isn't, we will patch it via setComposeDetails below.
+                    break;
+                  }
+                  await new Promise(r => Services.tm.dispatchToMainThread(() => r()));
+                }
+
+                const isPlain = !!(details && details.isPlainText);
+                const existingBody = (details && typeof details.body === "string") ? details.body : "";
+                const existingPlain = (details && typeof details.plainTextBody === "string") ? details.plainTextBody : "";
+
+                // If the prefix didn't make it in via beginReply(details), patch it now.
+                if (plainPrefix) {
+                  if (existingPlain && !existingPlain.includes(plainPrefix.trim().slice(0, Math.min(20, plainPrefix.trim().length)))) {
+                    const newPlain = includeQuotedOriginal ? (plainPrefix + "\n\n" + existingPlain) : plainPrefix;
+                    await composeApi.setComposeDetails(tabId, { plainTextBody: newPlain });
+                  }
+                } else if (htmlPrefix) {
+                  if (existingBody && !existingBody.includes(htmlPrefix.slice(0, 10))) {
+                    const newBody = includeQuotedOriginal ? (htmlPrefix + existingBody) : htmlPrefix;
+                    await composeApi.setComposeDetails(tabId, { body: newBody });
+                  }
                 }
 
                 const detailsAfterSet = await composeApi.getComposeDetails(tabId);
 
-                // Save after body is updated.
                 await composeApi.saveMessage(tabId, { mode: "draft" });
 
-                // Include some debug info so we can see what Thunderbird thought the compose body was.
                 const debug = {
                   isPlain,
+                  beginDetailsUsed: !!beginDetails,
                   hadBodyBefore: !!(detailsBefore && detailsBefore.body),
                   hadPlainBefore: !!(detailsBefore && detailsBefore.plainTextBody),
                   afterHasBody: !!(detailsAfterSet && detailsAfterSet.body),
