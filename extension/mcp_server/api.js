@@ -199,6 +199,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         }
       },
       {
+        name: "listAccounts",
+        title: "List Email Accounts",
+        description: "List configured email accounts (key, name, type, email, username, hostName)",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "listFolders",
+        title: "List Folders",
+        description: "List folders for an account (or all accounts) with message/unread counts",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountKey: { type: "string", description: "Optional account key from listAccounts" }
+          },
+          required: [],
+        },
+      },
+      {
+        name: "getRecentMessages",
+        title: "Get Recent Messages",
+        description: "Get recent messages sorted by date (newest first), optionally unread-only and/or folder-scoped",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Optional folder URI (imap://.../INBOX). If omitted, uses all Inbox folders." },
+            limit: { type: "number", description: "Max messages (default 20, max 100)" },
+            daysBack: { type: "number", description: "Days back to include (default 30)" },
+            unreadOnly: { type: "boolean", description: "Only unread (default false)" }
+          },
+          required: [],
+        },
+      },
+      {
         name: "openNativeReplyCompose",
         title: "Open Native Reply Compose",
         description: "Open a native Thunderbird Reply/ReplyAll compose window (with quoted original) for a message. Use UI automation to paste your reply at top.",
@@ -624,6 +657,127 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               return results;
+            }
+
+
+            function listAccounts() {
+              try {
+                const accounts = [];
+                for (const account of MailServices.accounts.accounts) {
+                  const server = account.incomingServer;
+                  accounts.push({
+                    key: account.key,
+                    name: account.name || (server && server.prettyName) || "",
+                    type: (server && server.type) || "",
+                    email: (account.defaultIdentity && account.defaultIdentity.email) ? account.defaultIdentity.email : "",
+                    username: (server && server.username) || "",
+                    hostName: (server && server.hostName) || "",
+                  });
+                }
+                return accounts;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function listFolders(accountKey) {
+              try {
+                const folders = [];
+
+                function folderType(flags) {
+                  return (flags & 0x00001000) ? "inbox" :
+                         (flags & 0x00000200) ? "sent" :
+                         (flags & 0x00000400) ? "drafts" :
+                         (flags & 0x00000100) ? "trash" :
+                         (flags & 0x00000800) ? "templates" : "folder";
+                }
+
+                function addFolderAndSubfolders(folder, acctInfo) {
+                  folders.push({
+                    name: folder.prettyName,
+                    path: folder.URI,
+                    type: folderType(folder.flags),
+                    accountKey: acctInfo.key,
+                    accountName: acctInfo.name,
+                    totalMessages: folder.getTotalMessages(false),
+                    unreadMessages: folder.getNumUnread(false)
+                  });
+
+                  if (folder.hasSubFolders) {
+                    for (const sub of folder.subFolders) {
+                      addFolderAndSubfolders(sub, acctInfo);
+                    }
+                  }
+                }
+
+                if (accountKey) {
+                  const account = MailServices.accounts.getAccount(accountKey);
+                  if (!account) return { error: `Account not found: ${accountKey}` };
+                  addFolderAndSubfolders(account.incomingServer.rootFolder, { key: account.key, name: account.name });
+                } else {
+                  for (const account of MailServices.accounts.accounts) {
+                    addFolderAndSubfolders(account.incomingServer.rootFolder, { key: account.key, name: account.name });
+                  }
+                }
+
+                return folders;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function getRecentMessages(folderPath, limit, daysBack, unreadOnly) {
+              try {
+                const maxLimit = Math.min(Math.max(parseInt(limit || 20, 10) || 20, 1), 100);
+                const days = Math.max(parseInt(daysBack || 30, 10) || 30, 1);
+                const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+                const all = [];
+
+                function collect(folder) {
+                  try {
+                    try { if (folder.server && folder.server.type === "imap") folder.updateFolder(null); } catch {}
+                    const db = folder.msgDatabase;
+                    if (!db) return;
+                    for (const msgHdr of db.enumerateMessages()) {
+                      const msgDateMs = (msgHdr.date || 0) / 1000;
+                      if (msgDateMs < cutoffMs) continue;
+                      if (unreadOnly && msgHdr.isRead) continue;
+                      all.push({
+                        id: msgHdr.messageId,
+                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+                        author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+                        recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                        date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                        _dateTs: msgHdr.date || 0,
+                        folder: folder.prettyName,
+                        folderPath: folder.URI,
+                        read: msgHdr.isRead,
+                        flagged: msgHdr.isFlagged,
+                      });
+                    }
+                  } catch {}
+                }
+
+                if (folderPath) {
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) return { error: `Folder not found: ${folderPath}` };
+                  collect(folder);
+                } else {
+                  for (const account of MailServices.accounts.accounts) {
+                    try {
+                      const root = account.incomingServer.rootFolder;
+                      const inbox = root.getFolderWithFlags(Ci.nsMsgFolderFlags.Inbox);
+                      if (inbox) collect(inbox);
+                    } catch {}
+                  }
+                }
+
+                all.sort((a, b) => (b._dateTs || 0) - (a._dateTs || 0));
+                const out = all.slice(0, maxLimit).map(({ _dateTs, ...rest }) => rest);
+                return { ok: true, count: out.length, results: out };
+              } catch (e) {
+                return { error: e.toString() };
+              }
             }
 
             function listCalendars() {
@@ -3366,6 +3520,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     args.maxResults,
                     args.sortOrder
                   );
+                case "listAccounts":
+                  return listAccounts();
+                case "listFolders":
+                  return listFolders(args.accountKey);
+                case "getRecentMessages":
+                  return getRecentMessages(args.folderPath, args.limit, args.daysBack, args.unreadOnly);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath);
                 case "getLatestUnread":
