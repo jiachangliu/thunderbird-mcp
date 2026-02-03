@@ -148,6 +148,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         }
       },
       {
+        name: "sendMailNow",
+        title: "Send Mail (Immediate)",
+        description: "Send an email immediately (no UI) using a specific account identity",
+        inputSchema: {
+          type: "object",
+          properties: {
+            fromEmail: { type: "string", description: "Sender account email (must match a configured identity)" },
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text" },
+            cc: { type: "string", description: "CC recipient (optional)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            closeAfterSend: { type: "boolean", description: "Close compose tab after sending (default: true)" }
+          },
+          required: ["fromEmail", "to", "subject", "body"]
+        }
+      },
+      {
         name: "saveDraft",
         title: "Save Draft",
         description: "Create a draft message (saved to the account Drafts folder for cloud sync). Supports idempotency to prevent duplicates.",
@@ -1128,6 +1146,68 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
                 return { success: true, message: "Compose window opened" };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function sendMailNow(fromEmail, to, subject, body, cc, isHtml, closeAfterSend = true) {
+              try {
+                if (!context || !context.apiCan || typeof context.apiCan.findAPIPath !== "function") {
+                  return { error: "WebExtension API container (context.apiCan) is not available" };
+                }
+
+                const accountsApi = context.apiCan.findAPIPath("accounts");
+                const composeApi = context.apiCan.findAPIPath("compose");
+                const tabsApi = context.apiCan.findAPIPath("tabs");
+                if (!accountsApi || !composeApi) {
+                  return { error: "Could not resolve accounts/compose API via context.apiCan" };
+                }
+
+                // Resolve identityId by email.
+                const accounts = await _withTimeout(accountsApi.list(), 15000, "accounts.list");
+                let identityId = null;
+                for (const acct of accounts || []) {
+                  for (const ident of (acct.identities || [])) {
+                    if (ident && ident.email && String(ident.email).toLowerCase() === String(fromEmail).toLowerCase()) {
+                      identityId = ident.id;
+                      break;
+                    }
+                  }
+                  if (identityId) break;
+                }
+                if (!identityId) {
+                  return { error: `Could not find identity for fromEmail=${fromEmail}` };
+                }
+
+                const tab = await _withTimeout(composeApi.beginNew(), 15000, "compose.beginNew");
+                const tabId = tab && tab.id;
+                if (!tabId) return { error: "compose.beginNew did not return a tabId" };
+
+                // Fill fields.
+                const details = {
+                  identityId,
+                  to: String(to || ""),
+                  cc: String(cc || ""),
+                  subject: String(subject || "")
+                };
+
+                if (isHtml) {
+                  details.body = String(body || "");
+                } else {
+                  details.plainTextBody = String(body || "");
+                }
+
+                await _withTimeout(composeApi.setComposeDetails(tabId, details), 20000, "compose.setComposeDetails");
+
+                // Send.
+                const sendRes = await _withTimeout(composeApi.sendMessage(tabId, { mode: "sendNow" }), 30000, "compose.sendMessage(sendNow)");
+
+                if (closeAfterSend && tabsApi && typeof tabsApi.remove === "function") {
+                  try { await _withTimeout(tabsApi.remove(tabId), 8000, "tabs.remove(compose)"); } catch {}
+                }
+
+                return { success: true, message: "Message sent", fromEmail, to, subject, sendResult: sendRes || null };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -3693,6 +3773,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listCalendars();
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
+                case "sendMailNow":
+                  return await sendMailNow(args.fromEmail, args.to, args.subject, args.body, args.cc, args.isHtml, args.closeAfterSend);
                 case "saveDraft":
                   return saveDraft(args.to, args.subject, args.body, args.cc, args.isHtml, args.idempotencyKey);
                 case "replyToMessage":
