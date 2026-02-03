@@ -4,7 +4,9 @@
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io/)
 
-> Inspired by [bb1/thunderbird-mcp](https://github.com/bb1/thunderbird-mcp). Rewritten from scratch with a bundled HTTP server, proper MIME decoding, and UTF-8 handling throughout.
+> Forked from [TKasperczyk/thunderbird-mcp](https://github.com/TKasperczyk/thunderbird-mcp) (which was inspired by [bb1/thunderbird-mcp](https://github.com/bb1/thunderbird-mcp)).
+> 
+> This fork includes additional tooling and bugfixes for real-world Outlook/IMAP usage (draft revision, robust search, TbSync workflows).
 
 An MCP server that lets you read email, search contacts, and draft replies in Thunderbird.
 
@@ -46,12 +48,16 @@ Example for `~/.claude.json`:
 
 | Tool | What it does |
 |------|--------------|
-| `searchMessages` | Find emails by subject, sender, or recipient |
+| `searchMessages` | Find emails by subject, sender, or recipient (supports date filters + sorting) |
+| `listAccounts` | List configured Thunderbird accounts |
+| `listFolders` | Browse folder hierarchy and message counts |
+| `getRecentMessages` | Get recent messages quickly (date-sorted) |
 | `getMessage` | Read full email content |
 | `searchContacts` | Look up contacts |
 | `listCalendars` | List your calendars |
 | `sendMail` | Open a compose window with pre-filled content |
 | `replyToMessage` | Open a reply with proper threading |
+| `forwardMessage` | Forward a message while preserving attachments |
 
 Compose tools open a window for you to review before sending. Nothing gets sent automatically.
 
@@ -108,11 +114,12 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | node mcp-bridge.cjs
 
 After changing extension code, you'll need to remove it from Thunderbird, restart, reinstall, and restart again. Thunderbird caches aggressively.
 
-## Known issues
+## Known issues / TODO
 
-- Replies don't include the quoted original message (Thunderbird limitation workaround)
 - IMAP folder databases can be stale until you click on them
 - Email bodies with weird control characters get sanitized to avoid breaking JSON
+
+(Several earlier TODOs have been implemented in this fork, including robust draft revision and improved search tooling.)
 
 ## Project structure
 
