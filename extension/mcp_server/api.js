@@ -168,7 +168,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "saveDraft",
         title: "Save Draft",
-        description: "Create a draft message (saved to the account Drafts folder for cloud sync). Supports idempotency to prevent duplicates.",
+        description: "Create a draft message (saved to the DEFAULT account Drafts folder for cloud sync). Supports idempotency to prevent duplicates.",
         inputSchema: {
           type: "object",
           properties: {
@@ -180,6 +180,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             idempotencyKey: { type: "string", description: "Optional stable key to avoid creating duplicate drafts on retries" }
           },
           required: ["to", "subject", "body"]
+        }
+      },
+      {
+        name: "saveDraftFromEmail",
+        title: "Save Draft (Specific Account)",
+        description: "Create a draft message saved to the Drafts folder of a specific identity (fromEmail).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            fromEmail: { type: "string", description: "Sender account email (must match a configured identity)" },
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text" },
+            cc: { type: "string", description: "CC recipient (optional)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional stable key to avoid creating duplicate drafts on retries" }
+          },
+          required: ["fromEmail", "to", "subject", "body"]
         }
       },
       {
@@ -1592,6 +1610,100 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return null;
               } catch {
                 return null;
+              }
+            }
+
+            function _findIdentityByEmail(fromEmail) {
+              try {
+                const needle = String(fromEmail || "").toLowerCase().trim();
+                if (!needle) return null;
+                // accounts.accounts is an nsIArray; use fixIterator.
+                for (const acct of fixIterator(MailServices.accounts.accounts, Ci.nsIMsgAccount)) {
+                  try {
+                    // Some Thunderbird builds expose identities as nsIArray; iterate defensively.
+                    for (const ident of fixIterator(acct.identities, Ci.nsIMsgIdentity)) {
+                      const em = (ident && ident.email) ? String(ident.email).toLowerCase().trim() : "";
+                      // Match either full email or username (some identities may omit email field).
+                      if (em && em === needle) return ident;
+                      if (!em) {
+                        try {
+                          const u = acct.incomingServer && acct.incomingServer.username ? String(acct.incomingServer.username).toLowerCase().trim() : "";
+                          if (u && u === needle) return acct.defaultIdentity || ident;
+                        } catch {}
+                      }
+                    }
+                    // Fallback: match by account incomingServer username.
+                    try {
+                      const u = acct.incomingServer && acct.incomingServer.username ? String(acct.incomingServer.username).toLowerCase().trim() : "";
+                      if (u && u === needle) return acct.defaultIdentity || null;
+                    } catch {}
+                  } catch {}
+                }
+              } catch {}
+              return null;
+            }
+
+            async function saveDraftFromEmail(fromEmail, to, subject, body, cc, isHtml, idempotencyKey) {
+              // Robust draft creation using WebExtension compose API so we can select identity by email.
+              // This avoids relying on MailServices identity iteration (which can be inconsistent across TB builds).
+              try {
+                if (isHtml) {
+                  return { error: "saveDraftFromEmail currently supports isHtml=false only (plain text)" };
+                }
+                if (!context || !context.apiCan || typeof context.apiCan.findAPIPath !== "function") {
+                  return { error: "WebExtension API container (context.apiCan) is not available" };
+                }
+
+                const accountsApi = context.apiCan.findAPIPath("accounts");
+                const composeApi = context.apiCan.findAPIPath("compose");
+                const tabsApi = context.apiCan.findAPIPath("tabs");
+                if (!accountsApi || !composeApi) {
+                  return { error: "Could not resolve accounts/compose API via context.apiCan" };
+                }
+
+                // Resolve identityId by email.
+                const accounts = await _withTimeout(accountsApi.list(), 15000, "accounts.list");
+                let identityId = null;
+                for (const acct of accounts || []) {
+                  for (const ident of (acct.identities || [])) {
+                    if (ident && ident.email && String(ident.email).toLowerCase() === String(fromEmail).toLowerCase()) {
+                      identityId = ident.id;
+                      break;
+                    }
+                  }
+                  if (identityId) break;
+                }
+                if (!identityId) {
+                  return { error: `Could not find identity for fromEmail=${fromEmail}` };
+                }
+
+                const tab = await _withTimeout(composeApi.beginNew(), 15000, "compose.beginNew");
+                const tabId = tab && tab.id;
+                if (!tabId) return { error: "compose.beginNew did not return a tabId" };
+
+                // Add an idempotency token line for deterministic matching/debugging.
+                const key = idempotencyKey || `draft-${_simpleHash32Hex(`${fromEmail}|${to}|${cc}|${subject}|${body}`)}`;
+                const tokenLine = `\n\n[mcp-draft-key:${key}]\n`;
+
+                const details = {
+                  identityId,
+                  to: String(to || ""),
+                  cc: String(cc || ""),
+                  subject: String(subject || ""),
+                  plainTextBody: String(body || "") + tokenLine,
+                };
+
+                await _withTimeout(composeApi.setComposeDetails(tabId, details), 20000, "compose.setComposeDetails");
+
+                const saveRes = await _withTimeout(composeApi.saveMessage(tabId, { mode: "draft" }), 30000, "compose.saveMessage(draft)");
+
+                if (tabsApi && typeof tabsApi.remove === "function") {
+                  try { await _withTimeout(tabsApi.remove(tabId), 8000, "tabs.remove(compose)"); } catch {}
+                }
+
+                return { success: true, message: "Draft saved", fromEmail, to, subject, idempotencyKey: key, saveResult: saveRes || null };
+              } catch (e) {
+                return { error: e.toString() };
               }
             }
 
@@ -3777,6 +3889,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await sendMailNow(args.fromEmail, args.to, args.subject, args.body, args.cc, args.isHtml, args.closeAfterSend);
                 case "saveDraft":
                   return saveDraft(args.to, args.subject, args.body, args.cc, args.isHtml, args.idempotencyKey);
+                case "saveDraftFromEmail":
+                  return saveDraftFromEmail(args.fromEmail, args.to, args.subject, args.body, args.cc, args.isHtml, args.idempotencyKey);
                 case "replyToMessage":
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
                 case "forwardMessage":
