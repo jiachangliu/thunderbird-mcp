@@ -131,40 +131,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath"],
         },
       },
-      {
-        name: "sendMail",
-        title: "Compose Mail",
-        description: "Open a compose window with pre-filled recipient, subject, and body for user review before sending",
-        inputSchema: {
-          type: "object",
-          properties: {
-            to: { type: "string", description: "Recipient email address" },
-            subject: { type: "string", description: "Email subject line" },
-            body: { type: "string", description: "Email body text" },
-            cc: { type: "string", description: "CC recipient (optional)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
-          },
-          required: ["to", "subject", "body"]
-        }
-      },
-      {
-        name: "sendMailNow",
-        title: "Send Mail (Immediate)",
-        description: "Send an email immediately (no UI) using a specific account identity",
-        inputSchema: {
-          type: "object",
-          properties: {
-            fromEmail: { type: "string", description: "Sender account email (must match a configured identity)" },
-            to: { type: "string", description: "Recipient email address" },
-            subject: { type: "string", description: "Email subject line" },
-            body: { type: "string", description: "Email body text" },
-            cc: { type: "string", description: "CC recipient (optional)" },
-            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
-            closeAfterSend: { type: "boolean", description: "Close compose tab after sending (default: true)" }
-          },
-          required: ["fromEmail", "to", "subject", "body"]
-        }
-      },
+      // NOTE: Email sending tools (sendMail/sendMailNow) intentionally removed for safety.
       {
         name: "saveDraft",
         title: "Save Draft",
@@ -3884,9 +3851,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "sendMail":
-                  return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
+                  return { error: "sendMail is disabled for safety (draft-only workflow)." };
                 case "sendMailNow":
-                  return await sendMailNow(args.fromEmail, args.to, args.subject, args.body, args.cc, args.isHtml, args.closeAfterSend);
+                  return { error: "sendMailNow is disabled for safety (draft-only workflow)." };
                 case "saveDraft":
                   return saveDraft(args.to, args.subject, args.body, args.cc, args.isHtml, args.idempotencyKey);
                 case "saveDraftFromEmail":
