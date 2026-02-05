@@ -131,7 +131,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath"],
         },
       },
-      // NOTE: Email sending tools (sendMail/sendMailNow) intentionally removed for safety.
+      {
+        name: "sendMail",
+        title: "Compose Mail",
+        description: "DISABLED: Open a compose window (email sending is disabled; use draft-only workflow)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text" },
+            cc: { type: "string", description: "CC recipient (optional)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" }
+          },
+          required: ["to", "subject", "body"]
+        }
+      },
+      {
+        name: "sendMailNow",
+        title: "Send Mail (Immediate)",
+        description: "DISABLED: Send an email immediately (no UI)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            fromEmail: { type: "string", description: "Sender account email (must match a configured identity)" },
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text" },
+            cc: { type: "string", description: "CC recipient (optional)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            closeAfterSend: { type: "boolean", description: "Close compose tab after sending (default: true)" }
+          },
+          required: ["fromEmail", "to", "subject", "body"]
+        }
+      },
       {
         name: "saveDraft",
         title: "Save Draft",
@@ -204,7 +237,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "forwardMessage",
         title: "Forward Message",
-        description: "Open a forward compose window for a message with attachments preserved",
+        description: "DISABLED: Forward a message (sending/forwarding is disabled; draft-only workflow)",
         inputSchema: {
           type: "object",
           properties: {
@@ -3861,7 +3894,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "replyToMessage":
                   return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
                 case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml);
+                  return { error: "forwardMessage is disabled for safety (draft-only workflow)." };
                 case "openNativeReplyCompose":
                   return openNativeReplyCompose(args.messageId, args.folderPath, args.replyAll);
                 case "replyToMessageDraft":
