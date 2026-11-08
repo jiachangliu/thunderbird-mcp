@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Thunderbird MCP Settings</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 16px;
+      background: #f9f9fa;
+      color: #15141a;
+      font-size: 14px;
+    }
+    h2 {
+      font-size: 16px;
+      margin: 0 0 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #cfcfd8;
+    }
+    .section {
+      background: #fff;
+      border: 1px solid #cfcfd8;
+      border-radius: 6px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .status-dot {
+      flex-shrink: 0;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .status-dot.running { background: #30e60b; }
+    .status-dot.stopped { background: #ff0039; }
+    #statusText { overflow-wrap: anywhere; }
+    .info-label {
+      color: #5b5b66;
+      min-width: 110px;
+      display: inline-block;
+    }
+    .info-value {
+      font-family: monospace;
+      font-size: 13px;
+    }
+    .account-list {
+      list-style: none;
+      padding: 0;
+      margin: 8px 0 0;
+    }
+    .account-list li {
+      padding: 6px 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .account-list li + li {
+      border-top: 1px solid #ededf0;
+    }
+    .account-list label {
+      cursor: pointer;
+      flex: 1;
+    }
+    .account-type {
+      color: #5b5b66;
+      font-size: 12px;
+      text-transform: uppercase;
+      margin-left: 4px;
+    }
+    .mode-note {
+      color: #5b5b66;
+      font-size: 13px;
+      margin: 8px 0 0;
+    }
+    .warning-note {
+      color: #9f1b00;
+    }
+    .token-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+    .token-row label {
+      color: #5b5b66;
+      min-width: 130px;
+    }
+    .token-row input[type="text"] {
+      flex: 1 1 360px;
+      min-width: 0;
+      font-family: monospace;
+      font-size: 13px;
+      padding: 6px 8px;
+      border: 1px solid #cfcfd8;
+      border-radius: 4px;
+    }
+    .token-row input[readonly] {
+      background: #f9f9fa;
+    }
+    .tool-group-header {
+      font-size: 13px;
+      font-weight: 600;
+      color: #15141a;
+      padding: 10px 0 4px;
+      margin-top: 4px;
+      border-bottom: 1px solid #ededf0;
+    }
+    .tool-group-header:first-child {
+      margin-top: 0;
+      padding-top: 4px;
+    }
+    .tool-crud-header {
+      font-size: 11px;
+      font-weight: 500;
+      color: #5b5b66;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 6px 0 2px 8px;
+    }
+    .tool-with-option {
+      flex-wrap: wrap;
+    }
+    .tool-option {
+      flex: 1 0 100%;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: 24px;
+      color: #5b5b66;
+      font-size: 13px;
+    }
+    .tool-option label {
+      flex: 0 0 auto;
+    }
+    .tool-option input {
+      width: 56px;
+      padding: 4px 6px;
+      border: 1px solid #cfcfd8;
+      border-radius: 4px;
+    }
+    .tool-option input[aria-invalid="true"] {
+      border-color: #d70022;
+      box-shadow: 0 0 0 1px #d70022;
+    }
+    .tool-option .range-note {
+      color: #5b5b66;
+      font-size: 12px;
+    }
+    .tool-limit-error {
+      flex: 1 0 100%;
+      margin-left: 24px;
+      color: #d70022;
+      font-size: 12px;
+    }
+    .save-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    button {
+      background: #0060df;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 8px 16px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover { background: #003eaa; }
+    button:disabled { background: #cfcfd8; cursor: default; }
+    .save-status {
+      color: #058b00;
+      font-size: 13px;
+    }
+    .save-status.error {
+      color: #d70022;
+    }
+  </style>
+</head>
+<body>
+
+<div class="section">
+  <h2>Server Status</h2>
+  <div class="status-row">
+    <span id="statusDot" class="status-dot stopped"></span>
+    <span id="statusText" role="status">Checking...</span>
+    <button id="retryServerBtn" type="button" hidden>Retry</button>
+  </div>
+  <div>
+    <span class="info-label">Port:</span>
+    <span id="serverPort" class="info-value">--</span>
+  </div>
+  <p id="serverPortNotice" class="mode-note" hidden></p>
+  <div>
+    <span class="info-label">Connection file:</span>
+    <span id="connFile" class="info-value">--</span>
+  </div>
+  <div>
+    <span class="info-label">Build:</span>
+    <span id="buildInfo" class="info-value">--</span>
+  </div>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="listenAll">
+        <span>Listen on all interfaces</span>
+      </label>
+    </li>
+  </ul>
+  <p class="mode-note" id="listenAllWarning" style="display:none; color: #d70022;">
+    Warning: this exposes the MCP server to every device on your local network over plain HTTP.
+    The authentication token and mail content travel in clear text on the LAN and can be read by
+    anyone able to observe the traffic. Enable only on trusted networks.
+  </p>
+  <div class="save-row">
+    <button id="saveListenAllBtn" disabled>Save</button>
+    <span id="saveListenAllStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Account Access</h2>
+  <p class="mode-note">
+    Select which accounts the MCP server can access. Saving a changed selection with all accounts
+    checked allows current and future accounts. Select at least one account before saving.
+  </p>
+  <ul id="accountList" class="account-list">
+    <li>Loading...</li>
+  </ul>
+  <div class="save-row">
+    <button id="saveBtn" disabled>Save</button>
+    <span id="saveStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Privacy</h2>
+  <p class="mode-note">
+    Encrypted message bodies, attachments, and inline images are withheld from MCP clients by default.
+    Opaque-signed S/MIME messages are also withheld while encrypted message access is off.
+    Thunderbird may still decrypt S/MIME messages locally. Enabling encrypted message access exposes
+    decrypted content to MCP clients and their AI providers, and allows direct replies and forwards
+    when <code>skipReview</code> is permitted.
+    While it is off, search and recent-message tools show the outer subject without a preview for
+    messages Thunderbird has recorded as OpenPGP-encrypted, searches do not match them, and
+    displayMessage refuses encrypted messages. Thunderbird provides no reliable encryption marker for
+    all message headers, so some cached subjects may still contain decrypted protected headers.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowEncryptedMessages">
+        <span>Allow MCP clients to read encrypted messages</span>
+      </label>
+    </li>
+  </ul>
+  <p class="mode-note">
+    When mail account access is restricted, calendars and address books are blocked unless you
+    allow them below. These permissions allow access to all calendars or all address books.
+    Without mail account restrictions, these two permissions are not required.
+    Tool Access and other safety settings still apply: contact changes always require
+    Allow contact writes below. These settings can only be changed here.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowAllCalendars">
+        <span>Allow all calendars</span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="allowAllAddressBooks">
+        <span>Allow all address books</span>
+      </label>
+    </li>
+  </ul>
+  <div class="save-row">
+    <button id="savePrivacyBtn" disabled>Save</button>
+    <span id="savePrivacyStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Tool Access</h2>
+  <p class="mode-note">
+    Uncheck tools to disable them. Disabled tools are hidden from MCP clients and cannot be called.
+    Infrastructure tools (listAccounts, listFolders, getAccountAccess) cannot be disabled.
+  </p>
+  <p class="mode-note">
+    Once you restrict Tool Access, tools added by future updates start unchecked.
+    Enable any new tools you want here and save. Tools you explicitly enable stay enabled.
+  </p>
+  <ul id="toolList" class="account-list">
+    <li>Loading...</li>
+  </ul>
+  <div class="save-row">
+    <button id="saveToolsBtn" disabled>Save</button>
+    <span id="saveToolsStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Authentication</h2>
+  <div class="token-row">
+    <label for="currentAuthToken">Current session token:</label>
+    <input type="text" id="currentAuthToken" readonly placeholder="Not available">
+    <button id="copyAuthTokenBtn" disabled>Copy</button>
+    <span id="copyAuthTokenStatus" class="save-status"></span>
+  </div>
+  <p class="mode-note warning-note">
+    Stable token mode keeps the same token across restarts. If the connection file leaks,
+    the token stays valid until you regenerate or clear it. Changes apply next time the MCP server starts.
+    The stored stable token is cleared on uninstall only while the add-on is enabled (best effort).
+    If you disable the add-on before uninstalling, regenerate the token before using it again.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="useStableAuthToken">
+        <span>Use stable token</span>
+      </label>
+    </li>
+  </ul>
+  <div id="stableAuthTokenControls" hidden>
+    <div class="token-row">
+      <label for="stableAuthToken">Stable token:</label>
+      <input type="text" id="stableAuthToken" autocomplete="off" spellcheck="false">
+      <button id="generateStableAuthTokenBtn">Generate</button>
+    </div>
+    <div class="save-row">
+      <button id="regenerateStableAuthTokenBtn">Regenerate</button>
+    </div>
+  </div>
+  <div class="save-row">
+    <span id="stableAuthTokenStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Send Safety</h2>
+  <p class="mode-note">
+    This setting is enabled by default. While enabled, MCP clients requesting
+    <code>skipReview: true</code> on sendMail, replyToMessage, forwardMessage,
+    createEvent, or createTask are rejected; the review window or dialog remains
+    available. Scheduling delivery through Send Later with <code>saveDraft</code>
+    and <code>sendAt</code> is also rejected; plain drafts remain available.
+    Re-enabling this block does not cancel already scheduled drafts.
+    Adding event attendees is blocked. Events with attendees other
+    than the calendar user are read-only through MCP: updates and deletions,
+    including individual occurrences, are rejected even when attendees are
+    omitted from the request. Exchange/Owl or CalDAV may email invitations,
+    updates, or cancellations with the event title and description without
+    review. Disabling this setting allows these writes, <code>skipReview</code>,
+    and scheduled drafts. Scheduling still requires the sendMail tool to be
+    enabled and an identity permitted by the unreviewed-send encryption checks.
+  </p>
+  <p class="mode-note">
+    Direct sendMail also requires at least one effective recipient, including
+    enabled automatic Cc/Bcc. Direct mail sends, replies, and forwards require
+    review when their conservative size estimate exceeds Thunderbird's positive
+    large-message threshold, or the threshold/estimate cannot be read safely.
+    The add-on does not change that preference. dryRunCompose reports the same
+    blockers; review windows remain available.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="blockSkipReview">
+        <span>Block <code>skipReview</code> (default) -- require review for mail, events, and tasks</span>
+      </label>
+    </li>
+  </ul>
+  <div class="save-row">
+    <button id="saveSkipReviewBtn" disabled>Save</button>
+    <span id="saveSkipReviewStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Filter Send Actions</h2>
+  <p class="mode-note">
+    Disabled by default. Enabling this lets MCP clients create, change, and run
+    filters that forward messages or reply from templates without a compose
+    review window. This setting is independent of Block <code>skipReview</code>.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowFilterSendActions" disabled>
+        <span>Allow automatic Forward/Reply filter actions</span>
+      </label>
+    </li>
+  </ul>
+  <p class="mode-note">
+    Turning this off does not disable saved filters or stop Thunderbird from
+    running them automatically. You can still disable or delete existing
+    Forward/Reply rules through MCP.
+  </p>
+  <div class="save-row">
+    <button id="saveFilterSendActionsBtn" disabled>Save</button>
+    <span id="saveFilterSendActionsStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Contact Writes</h2>
+  <p class="mode-note">
+    Disabled by default. Enabling this lets MCP clients create, change, and
+    delete contacts in your address books. Changes are saved immediately without
+    a review step. Reading contacts does not require this permission.
+    Tool Access still applies. If mail account access is restricted, also enable
+    Allow all address books in Privacy. Turning this off blocks future MCP changes;
+    it does not undo saved changes.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowContactWrites" disabled>
+        <span>Allow contact writes (createContact, updateContact, deleteContact)</span>
+      </label>
+    </li>
+  </ul>
+  <div class="save-row">
+    <button id="saveContactWritesBtn" disabled>Save</button>
+    <span id="saveContactWritesStatus" class="save-status"></span>
+  </div>
+</div>
+
+<script src="tool-access.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

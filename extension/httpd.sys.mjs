@@ -500,6 +500,11 @@ nsHttpServer.prototype = {
     this._start(port, "[::1]", true);
   },
 
+  // Bind to all interfaces (0.0.0.0 + [::]) for WSL/Docker/remote access.
+  startAll(port) {
+    this._start(port, "0.0.0.0");
+  },
+
   _start(port, host, dualStack) {
     if (this._socket) {
       throw Components.Exception("", Cr.NS_ERROR_ALREADY_INITIALIZED);
@@ -880,6 +885,7 @@ export var HttpServer = nsHttpServer;
 // addresses (e.g. [::1]), but may also match valid non-canonical IPv6 addresses
 // (e.g. [::127.0.0.1]) and even invalid bracketed addresses ([::], [99999::]).
 
+// BEGIN HOST HEADER IDENTITY HELPERS
 const HOST_REGEX = new RegExp(
   "^(?:" +
     // *( domainlabel "." )
@@ -895,6 +901,55 @@ const HOST_REGEX = new RegExp(
     ")$",
   "i"
 );
+
+function resolveIdentityFromHostHeader(identity, hostPort) {
+  var host, port;
+  var colon = hostPort.lastIndexOf(":");
+  if (hostPort.lastIndexOf("]") > colon) {
+    colon = -1;
+  }
+  if (colon < 0) {
+    host = hostPort;
+    port = "";
+  } else {
+    host = hostPort.substring(0, colon);
+    port = hostPort.substring(colon + 1);
+  }
+
+  // NB: We allow an empty port here because, oddly, a colon may be
+  //     present even without a port number, e.g. "example.com:"; in this
+  //     case the default port applies.
+  // Local patch: reject invalid ports before ServerIdentity can throw an XPCOM
+  // exception; malformed client input must be an HTTP error.
+  if (!HOST_REGEX.test(host) || !/^\d*$/.test(port) || +port > 65535) {
+    return { error: HTTP_400, reason: "malformed" };
+  }
+
+  // If we're not given a port, we're stuck, because we don't know what
+  // scheme to use to look up the correct port here, in general.  Since
+  // the HTTPS case requires a tunnel/proxy and thus requires that the
+  // requested URI be absolute (and thus contain the necessary
+  // information), let's assume HTTP will prevail and use that.
+  port = +port || 80;
+
+  var scheme = identity.getScheme(host, port);
+  if (!scheme) {
+    if (identity._host === "0.0.0.0") {
+      // In listenAll/startAll mode the Host header may reflect Docker,
+      // reverse-proxy, or WSL port mapping, so it is NOT a security boundary.
+      // The required Authorization Bearer token is the security boundary.
+      return {
+        scheme: identity.primaryScheme,
+        host: identity.primaryHost,
+        port: identity.primaryPort,
+      };
+    }
+    return { error: HTTP_400, reason: "unrecognized" };
+  }
+
+  return { scheme, host, port };
+}
+// END HOST HEADER IDENTITY HELPERS
 
 /**
  * Represents the identity of a server.  An identity consists of a set of
@@ -1299,6 +1354,10 @@ const READER_IN_HEADERS = 1;
 const READER_IN_BODY = 2;
 const READER_FINISHED = 3;
 
+// Local patch: bound pre-auth request metadata, including already parsed lines.
+const MAX_REQUEST_HEADER_BYTES = 64 * 1024;
+const REQUEST_READ_SIZE = 8192;
+
 /**
  * Reads incoming request data asynchronously, does any necessary preprocessing,
  * and forwards it to the request handler.  Processing occurs in three states:
@@ -1328,6 +1387,9 @@ function RequestReader(connection) {
    * metadata from it).
    */
   this._data = new LineData();
+
+  /** Local patch: cumulative request-line/header bytes, including CRLFs. */
+  this._headerBytes = 0;
 
   /**
    * The amount of data remaining to be read from the body of this request.
@@ -1382,14 +1444,17 @@ RequestReader.prototype = {
     }
 
     try {
-      data.appendBytes(readBytes(input, input.available()));
+      // Local patch: do not allocate all available socket data before checking
+      // framing. This also bounds overshoot for an unterminated metadata line.
+      data.appendBytes(
+        readBytes(input, Math.min(input.available(), REQUEST_READ_SIZE))
+      );
     } catch (e) {
-      if (streamClosed(e)) {
-        dumpn(
-          "*** WARNING: unexpected error when reading from socket; will " +
-            "be treated as if the input stream had been closed"
-        );
-        dumpn("*** WARNING: actual error was: " + e);
+      // Local patch: only a closed stream is beyond answering. Unexpected
+      // read failures take the same logged HTTP error path as parser failures.
+      if (e == null || !streamClosed(e)) {
+        this._handleError(e);
+        return;
       }
 
       // We've lost a race -- input has been closed, but we're still expecting
@@ -1403,29 +1468,34 @@ RequestReader.prototype = {
       return;
     }
 
-    switch (this._state) {
-      default:
-        NS_ASSERT(false, "invalid state: " + this._state);
-        break;
-
-      case READER_IN_REQUEST_LINE:
-        if (!this._processRequestLine()) {
+    // Local patch: framing errors must not fall into the socket-closed catch.
+    try {
+      switch (this._state) {
+        default:
+          NS_ASSERT(false, "invalid state: " + this._state);
           break;
-        }
-      /* fall through */
 
-      case READER_IN_HEADERS:
-        if (!this._processHeaders()) {
-          break;
-        }
-      /* fall through */
+        case READER_IN_REQUEST_LINE:
+          if (!this._processRequestLine()) {
+            break;
+          }
+        /* fall through */
 
-      case READER_IN_BODY:
-        this._processBody();
-    }
+        case READER_IN_HEADERS:
+          if (!this._processHeaders()) {
+            break;
+          }
+        /* fall through */
 
-    if (this._state != READER_FINISHED) {
-      input.asyncWait(this, 0, 0, Services.tm.currentThread);
+        case READER_IN_BODY:
+          this._processBody();
+      }
+
+      if (this._state != READER_FINISHED) {
+        input.asyncWait(this, 0, 0, Services.tm.currentThread);
+      }
+    } catch (e) {
+      this._handleError(e);
     }
   },
 
@@ -1435,6 +1505,21 @@ RequestReader.prototype = {
   QueryInterface: ChromeUtils.generateQI(["nsIInputStreamCallback"]),
 
   // PRIVATE API
+
+  // Local patch: reuse LineData's parser, but keep the budget after it removes
+  // lines. Partial lines count too; body bytes coalesced with the final CRLF do
+  // not. Only request-line/header parsing calls this wrapper.
+  _readLine(out) {
+    var complete = this._data.readLine(out);
+    if (complete) {
+      this._headerBytes += out.value.length + 2;
+    }
+    var pending = complete ? 0 : this._data._data.length;
+    if (this._headerBytes + pending > MAX_REQUEST_HEADER_BYTES) {
+      throw HTTP_400;
+    }
+    return complete;
+  },
 
   /**
    * Processes unprocessed, downloaded data as a request line.
@@ -1447,10 +1532,9 @@ RequestReader.prototype = {
 
     // Servers SHOULD ignore any empty line(s) received where a Request-Line
     // is expected (section 4.1).
-    var data = this._data;
     var line = {};
     var readSuccess;
-    while ((readSuccess = data.readLine(line)) && line.value == "") {
+    while ((readSuccess = this._readLine(line)) && line.value == "") {
       dumpn("*** ignoring beginning blank line...");
     }
 
@@ -1490,13 +1574,29 @@ RequestReader.prototype = {
       if (done) {
         var request = this._metadata;
 
-        // XXX this is wrong for requests with transfer-encodings applied to
-        //     them, particularly chunked (which by its nature can have no
-        //     meaningful Content-Length header)!
-        this._contentLength = request.hasHeader("Content-Length")
-          ? parseInt(request.getHeader("Content-Length"), 10)
-          : 0;
+        // Local patch: the MCP transport uses Content-Length, never chunked
+        // decoding. Reject any Transfer-Encoding, including TE + CL ambiguity.
+        if (request.hasHeader("Transfer-Encoding")) {
+          throw HTTP_501;
+        }
+        if (request.hasHeader("Content-Length")) {
+          // nsHttpHeaders already strips surrounding HTTP whitespace and joins
+          // duplicate fields with commas. Accept decimal digits only, so even
+          // identical duplicates and parseInt-style prefixes are rejected.
+          var contentLength = request.getHeader("Content-Length");
+          if (!/^\d+$/.test(contentLength)) {
+            throw HTTP_400;
+          }
+          this._contentLength = Number(contentLength);
+        }
         dumpn("_processHeaders, Content-length=" + this._contentLength);
+
+        // Reject oversized request bodies before buffering into memory.
+        // 32 MB accommodates MAX_BASE64_SIZE (25 MB) inline attachments
+        // plus JSON-RPC framing overhead. Aligned with api.js MAX_REQUEST_BODY.
+        if (this._contentLength > 32 * 1024 * 1024) {
+          throw HTTP_413;
+        }
 
         this._state = READER_IN_BODY;
       }
@@ -1516,8 +1616,6 @@ RequestReader.prototype = {
    */
   _processBody() {
     NS_ASSERT(this._state == READER_IN_BODY);
-
-    // XXX handle chunked transfer-coding request bodies!
 
     try {
       if (this._contentLength > 0) {
@@ -1567,8 +1665,26 @@ RequestReader.prototype = {
     var metadata = this._metadata;
     var headers = metadata._headers;
 
-    // 19.6.1.1 -- servers MUST report 400 to HTTP/1.1 requests w/o Host header
     var identity = this._connection.server.identity;
+    // Local patch: validate any supplied Host, even when HTTP/1.0 or an
+    // absolute Request-URI supplies the authority. Only malformed headers are
+    // rejected here; an unrecognized valid Host matters only when resolving it.
+    var hostPort, resolvedIdentity;
+    if (headers.hasHeader("Host")) {
+      hostPort = headers.getHeader("Host");
+      resolvedIdentity = resolveIdentityFromHostHeader(identity, hostPort);
+      if (resolvedIdentity.error && resolvedIdentity.reason === "malformed") {
+        dumpn(
+          "*** malformed hostname (" +
+            hostPort +
+            ") in Host " +
+            "header, 400 time"
+        );
+        throw resolvedIdentity.error;
+      }
+    }
+
+    // 19.6.1.1 -- servers MUST report 400 to HTTP/1.1 requests w/o Host header
     if (metadata._httpVersion.atLeast(nsHttpVersion.HTTP_1_1)) {
       if (!headers.hasHeader("Host")) {
         dumpn("*** malformed HTTP/1.1 or greater request with no Host header!");
@@ -1580,54 +1696,19 @@ RequestReader.prototype = {
       // server identity data at this point, because the request just doesn't
       // contain enough data on its own to do this, sadly.
       if (!metadata._host) {
-        var host, port;
-        var hostPort = headers.getHeader("Host");
-        var colon = hostPort.lastIndexOf(":");
-        if (hostPort.lastIndexOf("]") > colon) {
-          colon = -1;
-        }
-        if (colon < 0) {
-          host = hostPort;
-          port = "";
-        } else {
-          host = hostPort.substring(0, colon);
-          port = hostPort.substring(colon + 1);
-        }
-
-        // NB: We allow an empty port here because, oddly, a colon may be
-        //     present even without a port number, e.g. "example.com:"; in this
-        //     case the default port applies.
-        if (!HOST_REGEX.test(host) || !/^\d*$/.test(port)) {
-          dumpn(
-            "*** malformed hostname (" +
-              hostPort +
-              ") in Host " +
-              "header, 400 time"
-          );
-          throw HTTP_400;
-        }
-
-        // If we're not given a port, we're stuck, because we don't know what
-        // scheme to use to look up the correct port here, in general.  Since
-        // the HTTPS case requires a tunnel/proxy and thus requires that the
-        // requested URI be absolute (and thus contain the necessary
-        // information), let's assume HTTP will prevail and use that.
-        port = +port || 80;
-
-        var scheme = identity.getScheme(host, port);
-        if (!scheme) {
+        if (resolvedIdentity.error) {
           dumpn(
             "*** unrecognized hostname (" +
               hostPort +
               ") in Host " +
               "header, 400 time"
           );
-          throw HTTP_400;
+          throw resolvedIdentity.error;
         }
 
-        metadata._scheme = scheme;
-        metadata._host = host;
-        metadata._port = port;
+        metadata._scheme = resolvedIdentity.scheme;
+        metadata._host = resolvedIdentity.host;
+        metadata._port = resolvedIdentity.port;
       }
     } else {
       NS_ASSERT(
@@ -1652,26 +1733,19 @@ RequestReader.prototype = {
    * @param e
    *   the specific error encountered, which is an HttpError in the case where
    *   the request is in some way invalid or cannot be fulfilled; if this isn't
-   *   an HttpError we're going to be paranoid and shut down, because that
-   *   shouldn't happen, ever
+   *   an HttpError, log the unexpected failure and answer only this connection
    */
   _handleError(e) {
     // Don't fall back into normal processing!
     this._state = READER_FINISHED;
 
-    var server = this._connection.server;
     if (e instanceof HttpError) {
       var code = e.code;
     } else {
-      dumpn(
-        "!!! UNEXPECTED ERROR: " +
-          e +
-          (e.lineNumber ? ", line " + e.lineNumber : "")
-      );
-
-      // no idea what happened -- be paranoid and shut down
+      // Local patch: a request failure must never shut down the MCP listener.
+      // Log the value directly, even if a native service threw a non-Error.
       code = 500;
-      server._requestQuit();
+      console.error(e);
     }
 
     // make attempted reuse of data an error
@@ -1734,7 +1808,7 @@ RequestReader.prototype = {
     try {
       metadata._httpVersion = new nsHttpVersion(match[1]);
       if (!metadata._httpVersion.atLeast(nsHttpVersion.HTTP_1_0)) {
-        throw new Error("unsupported HTTP version");
+        throw HTTP_501;
       }
     } catch (e) {
       // we support HTTP/1.0 and HTTP/1.1 only
@@ -1744,10 +1818,8 @@ RequestReader.prototype = {
     var fullPath = request[1];
 
     if (metadata._method == "CONNECT") {
-      metadata._path = "CONNECT";
-      metadata._scheme = "https";
-      [metadata._host, metadata._port] = fullPath.split(":");
-      return;
+      // Local patch: MCP serves HTTP requests, never proxy tunnels.
+      throw HTTP_501;
     }
 
     var serverIdentity = this._connection.server.identity;
@@ -1829,8 +1901,6 @@ RequestReader.prototype = {
 
     dumpn("*** _parseHeaders");
 
-    var data = this._data;
-
     var headers = this._metadata._headers;
     var lastName = this._lastHeaderName;
     var lastVal = this._lastHeaderValue;
@@ -1847,7 +1917,7 @@ RequestReader.prototype = {
           : "lastName without lastVal?  lastName: '" + lastName + "'"
       );
 
-      if (!data.readLine(line)) {
+      if (!this._readLine(line)) {
         // save any data we have from the header we might still be processing
         this._lastHeaderName = lastName;
         this._lastHeaderValue = lastVal;
@@ -2300,7 +2370,7 @@ function maybeAddInformationalResponse(file, metadata, response) {
 /**
  * An object which handles requests for a server, executing default and
  * overridden behaviors as instructed by the code which uses and manipulates it.
- * Default behavior includes the paths / and /trace (diagnostics), with some
+ * Default behavior includes the path / (diagnostics), with some
  * support for HTTP error pages for various codes and fallback to HTTP 500 if
  * those codes fail for any reason.
  *
@@ -2468,10 +2538,11 @@ ServerHandler.prototype = {
             " error: " +
             "e2 == " +
             e2 +
-            ", shutting down server"
+            ", aborting response"
         );
 
-        connection.server._requestQuit();
+        // Local patch: even an error-handler failure is connection-local.
+        console.error(e2);
         response.abort(e2);
         return;
       }
@@ -3246,8 +3317,7 @@ ServerHandler.prototype = {
 
       // RFC 2616 says that we should try to handle an error by its class if we
       // can't otherwise handle it -- if that fails, we revert to handling it as
-      // a 500 internal server error, and if that fails we throw and shut down
-      // the server
+      // a 500 internal server error, and if that fails we abort the response.
 
       // actually handle the error
       try {
@@ -3383,8 +3453,9 @@ ServerHandler.prototype = {
       response.bodyOutputStream.write(body, body.length);
     },
     500(metadata, response) {
+      // Local patch: reader errors have no reliable request HTTP version.
       response.setStatusLine(
-        metadata.httpVersion,
+        "1.1",
         500,
         "Internal Server Error"
       );
@@ -3402,7 +3473,8 @@ ServerHandler.prototype = {
       response.bodyOutputStream.write(body, body.length);
     },
     501(metadata, response) {
-      response.setStatusLine(metadata.httpVersion, 501, "Not Implemented");
+      // Local patch: this also handles failures before a request line is parsed.
+      response.setStatusLine("1.1", 501, "Not Implemented");
       response.setHeader("Content-Type", "text/html;charset=utf-8", false);
 
       var body =
@@ -3435,6 +3507,9 @@ ServerHandler.prototype = {
   /**
    * Contains handlers for the default set of URIs contained in this server.
    */
+  // /trace endpoint removed — it echoed all request headers (including
+  // Authorization tokens) without authentication, enabling token leakage
+  // to any local process.
   _defaultPaths: {
     "/": function (metadata, response) {
       response.setStatusLine(metadata.httpVersion, 200, "OK");
@@ -3450,39 +3525,6 @@ ServerHandler.prototype = {
                         files!</p>\
                     </body>\
                   </html>";
-
-      response.bodyOutputStream.write(body, body.length);
-    },
-
-    "/trace": function (metadata, response) {
-      response.setStatusLine(metadata.httpVersion, 200, "OK");
-      response.setHeader("Content-Type", "text/plain;charset=utf-8", false);
-
-      var body =
-        "Request-URI: " +
-        metadata.scheme +
-        "://" +
-        metadata.host +
-        ":" +
-        metadata.port +
-        metadata.path +
-        "\n\n";
-      body += "Request (semantically equivalent, slightly reformatted):\n\n";
-      body += metadata.method + " " + metadata.path;
-
-      if (metadata.queryString) {
-        body += "?" + metadata.queryString;
-      }
-
-      body += " HTTP/" + metadata.httpVersion + "\r\n";
-
-      var headEnum = metadata.headers;
-      while (headEnum.hasMoreElements()) {
-        var fieldName = headEnum
-          .getNext()
-          .QueryInterface(Ci.nsISupportsString).data;
-        body += fieldName + ": " + metadata.getHeader(fieldName) + "\r\n";
-      }
 
       response.bodyOutputStream.write(body, body.length);
     },
@@ -3818,7 +3860,18 @@ Response.prototype = {
     }
 
     var dataAsString = String(data);
-    this.bodyOutputStream.write(dataAsString, dataAsString.length);
+    // Encode as UTF-8 to correctly handle non-ASCII characters.
+    // The default bodyOutputStream.write() only takes the low byte of each
+    // UTF-16 code unit, silently discarding the high byte and corrupting
+    // any non-Latin-1 text (e.g., CJK characters).
+    var encoder = new TextEncoder();
+    var utf8Bytes = encoder.encode(dataAsString);
+    var binaryChars = new Array(utf8Bytes.length);
+    for (var i = 0; i < utf8Bytes.length; i++) {
+      binaryChars[i] = String.fromCharCode(utf8Bytes[i]);
+    }
+    var binaryStr = binaryChars.join('');
+    this.bodyOutputStream.write(binaryStr, binaryStr.length);
   },
 
   //

@@ -1,0 +1,186 @@
+name: Build and Release
+
+# Fires when a version tag is pushed (the maintainer's bump+tag step). Builds
+# the XPI from the tagged commit -- which already contains the bumped
+# package.json -- so the extension version always matches the tag, and attaches
+# it to the GitHub release. No version is threaded into build.sh; the tag is the
+# source of truth.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and push the update manifest to gh-pages
+    steps:
+      # Credentials are kept (no persist-credentials: false): the gh-pages step below pushes with them.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify release commit is on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not contained in origin/main; refusing to release. Merge the commit into main before tagging."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          # Never restore a dependency cache in the job that can write the release and the update channel.
+          package-manager-cache: false
+
+      - name: Verify package.json version matches the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${TAG}) does not match package.json version ${PKG}. Bump package.json before tagging."
+            exit 1
+          fi
+          echo "Version OK: ${PKG}"
+
+      - name: Run tests
+        run: node --test test/*.cjs
+
+      - name: Verify gh-pages branch exists
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if ! git ls-remote --exit-code --heads origin gh-pages > /dev/null; then
+            echo "::error::gh-pages branch does not exist on origin; refusing to create a release without an update-manifest target."
+            exit 1
+          fi
+
+      - name: Build extension
+        # Rebuilds of the same tag must produce the same bytes for immutable releases.
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" TZ=UTC bash scripts/build.sh
+
+      - name: Verify built manifest version matches the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          MAN="$(node -p "require('./extension/manifest.json').version")"
+          if [ "$TAG" != "$MAN" ]; then
+            echo "::error::Built manifest version ${MAN} does not match tag ${TAG}."
+            exit 1
+          fi
+
+      - name: Rename XPI to versioned filename
+        run: mv dist/thunderbird-mcp.xpi "dist/thunderbird-mcp-${GITHUB_REF_NAME}.xpi"
+
+      # GitHub CLI (preinstalled on the runner) rather than a third-party action: no external code runs in the job
+      # that holds a token able to write the repository, including gh-pages (the update channel).
+      - name: Create / update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          XPI="dist/thunderbird-mcp-${TAG}.xpi"
+          ASSET="${XPI##*/}"
+          test -f "$XPI" || { echo "::error::$XPI not found"; exit 1; }
+          if ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"; then
+            if grep -Fxq -- "$ASSET" <<< "$ASSETS"; then
+              TMP_ASSET_DIR="$(mktemp -d)"
+              trap 'rm -rf "$TMP_ASSET_DIR"' EXIT
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir "$TMP_ASSET_DIR"
+              HASH="$(sha256sum "$XPI" | cut -d' ' -f1)"
+              RELEASE_HASH="$(sha256sum "$TMP_ASSET_DIR/$ASSET" | cut -d' ' -f1)"
+              if [ "$HASH" != "$RELEASE_HASH" ]; then
+                echo "::error::Release asset ${ASSET} already exists with sha256 ${RELEASE_HASH}, but this build has ${HASH}; refusing to replace it."
+                exit 1
+              fi
+              echo "Release asset ${ASSET} already has sha256 ${HASH}; skipping upload."
+            else
+              gh release upload "$TAG" "$XPI" --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$TAG" "$XPI" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes ""
+          fi
+
+      - name: Publish update manifest to gh-pages
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+
+          XPI="dist/thunderbird-mcp-${GITHUB_REF_NAME}.xpi"
+          TAG="${GITHUB_REF_NAME}"
+          VER="${GITHUB_REF_NAME#v}"
+          HASH="$(sha256sum "$XPI" | cut -d' ' -f1)"
+          ASSET_URL="https://github.com/TKasperczyk/thunderbird-mcp/releases/download/${TAG}/thunderbird-mcp-${TAG}.xpi"
+          TMP_ASSET="$(mktemp)"
+
+          cleanup() {
+            rm -f "$TMP_ASSET"
+            git worktree remove --force /tmp/ghp 2>/dev/null || true
+            git worktree prune || true
+          }
+          trap cleanup EXIT
+
+          downloaded=0
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL "$ASSET_URL" -o "$TMP_ASSET" &&
+              printf '%s  %s\n' "$HASH" "$TMP_ASSET" | sha256sum -c -; then
+              downloaded=1
+              break
+            fi
+            echo "Release asset not ready or hash mismatch on attempt ${attempt}; retrying..."
+            sleep 5
+          done
+
+          if [ "$downloaded" -ne 1 ]; then
+            echo "::error::Release asset ${ASSET_URL} was not downloadable with expected sha256 ${HASH}."
+            exit 1
+          fi
+
+          TAG="$TAG" VER="$VER" HASH="$HASH" node scripts/gen-updates.js > /tmp/updates.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages:refs/remotes/origin/gh-pages
+          git worktree remove --force /tmp/ghp 2>/dev/null || true
+          git worktree prune
+          git worktree add /tmp/ghp origin/gh-pages
+          mkdir -p /tmp/ghp/thunderbird-mcp
+          cp /tmp/updates.json /tmp/ghp/thunderbird-mcp/updates.json
+          git -C /tmp/ghp add thunderbird-mcp/updates.json
+
+          if git -C /tmp/ghp diff --cached --quiet; then
+            echo "updates.json unchanged; nothing to publish."
+            exit 0
+          fi
+
+          git -C /tmp/ghp commit -m "Update Thunderbird MCP update manifest for ${TAG}"
+
+          for attempt in 1 2 3; do
+            if git -C /tmp/ghp push origin HEAD:gh-pages; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              break
+            fi
+            echo "Push failed on attempt ${attempt}; rebasing onto latest gh-pages..."
+            git -C /tmp/ghp fetch origin gh-pages:refs/remotes/origin/gh-pages
+            git -C /tmp/ghp rebase origin/gh-pages
+            sleep 3
+          done
+
+          echo "::error::Failed to push thunderbird-mcp/updates.json to gh-pages after retries."
+          exit 1

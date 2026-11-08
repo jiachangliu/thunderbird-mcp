@@ -1,143 +1,22 @@
-# Thunderbird MCP
+# Thunderbird MCP draft-only fork
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
-[![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io/)
+This branch integrates [Thunderbird MCP v0.10.0](https://github.com/TKasperczyk/thunderbird-mcp/tree/v0.10.0) while keeping this fork's extension ID and local draft workflow. The Node stdio bridge and Thunderbird experiment use the same draft-only rules. Use the bridge and XPI from the same checkout.
 
-> Forked from [TKasperczyk/thunderbird-mcp](https://github.com/TKasperczyk/thunderbird-mcp) (which was inspired by [bb1/thunderbird-mcp](https://github.com/bb1/thunderbird-mcp)).
-> 
-> This fork includes additional tooling and bugfixes for real-world Outlook/IMAP usage (draft revision, robust search, TbSync workflows).
+## Mail workflow
 
-An MCP server that lets you read email, search contacts, and draft replies in Thunderbird.
+- `getLatestUnread` and `getLatestUnreadBatch` read the newest unread messages without changing their read state. If no folder is specified, they use the Inbox of an accessible account. `setMessageRead` explicitly changes the flag through Thunderbird's folder API.
+- `getMessage` defaults to plain text, uses upstream MIME decoding and fallback, and provides the legacy `bodyText`, `bodyHtml`, and `bodyType` fields when they fit the output budget. Request `bodyFormat: "html"` to get the stored HTML where available. Raw reads, including `getRawMessage`, use upstream account and encrypted-content checks.
+- `saveDraft` and `saveDraftFromEmail` save drafts. `replyToMessage` and the legacy `replyToMessageDraft`, `replyToMessageDraftComposeApi`, and `replyToMessageDraftNativeEditor` names use the upstream threaded draft save. These reply aliases keep the quote and close the saved compose window. Legacy window and close-prompt controls return an error.
+- `sendMail`, `sendMailNow`, `forwardMessage`, scheduled delivery, and unreviewed replies are blocked. Calendar writes and filter creation, edits, or manual runs that could deliver mail are also blocked. The upstream Options page may show its original controls. Those preferences cannot enable these operations in the fork. Send reviewed drafts manually in Thunderbird.
+- A customized upstream tool allowlist may require enabling the compatibility aliases explicitly. An alias also requires its underlying read, update, or draft tool to be enabled.
 
-## How it works
+The old native in-place editor, unsaved compose-window helper, and debug tools were not carried forward. To replace a draft through the current API, use `saveDraft` with `replaceMessageId` and `replaceFolderPath` and supply any fields to retain, including recipients, threading headers, and attachments. The old automation notes and shell scripts document the earlier transport and are historical.
 
-```
-MCP Client <--stdio--> mcp-bridge.cjs <--HTTP--> Thunderbird Extension
-```
+## Build and offline tests
 
-The Thunderbird extension runs a local HTTP server on port 8765. The Node.js bridge translates between MCP's stdio protocol and HTTP so MCP clients can talk to it.
-
-## Setup
-
-**1. Install the extension**
-
-```bash
-./scripts/build.sh
-./scripts/install.sh
+```sh
+npm test
+bash scripts/build.sh
 ```
 
-Restart Thunderbird.
-
-**2. Configure your MCP client**
-
-Example for `~/.claude.json`:
-
-```json
-{
-  "mcpServers": {
-    "thunderbird-mail": {
-      "command": "node",
-      "args": ["/path/to/thunderbird-mcp/mcp-bridge.cjs"]
-    }
-  }
-}
-```
-
-## What you can do
-
-| Tool | What it does |
-|------|--------------|
-| `searchMessages` | Find emails by subject, sender, or recipient (supports date filters + sorting) |
-| `listAccounts` | List configured Thunderbird accounts |
-| `listFolders` | Browse folder hierarchy and message counts |
-| `getRecentMessages` | Get recent messages quickly (date-sorted) |
-| `getMessage` | Read full email content |
-| `searchContacts` | Look up contacts |
-| `listCalendars` | List your calendars |
-| `sendMail` | Open a compose window with pre-filled content |
-| `replyToMessage` | Open a reply with proper threading |
-| `forwardMessage` | Forward a message while preserving attachments |
-
-Compose tools open a window for you to review before sending. Nothing gets sent automatically.
-
-## Use native Thunderbird WebExtension APIs (preferred)
-
-When implementing new capabilities, **prefer Thunderbird's native WebExtension APIs** whenever possible. They are documented here:
-
-- <https://webextension-api.thunderbird.net/en/mv3/index.html>
-
-This documentation is the canonical reference for what extensions can do in a stable, supported way.
-
-When the WebExtension docs are insufficient (or behavior differs across Thunderbird versions), you can also consult the Thunderbird source code:
-
-- <https://hg-edge.mozilla.org>
-
-In practice, the combination of the **WebExtension API docs** + **Thunderbird source** is usually enough to debug most extension/MCP integration issues.
-
-Examples of high-leverage native APIs:
-- `browser.messages.*` – list/search/read messages, attachments, move/copy/delete (with the right permissions)
-- `browser.compose.*` – beginReply/beginNew, setComposeDetails, saveMessage (draft), sendMessage
-- `browser.accounts.*` – list accounts/identities/folders and resolve folder ids
-
-We still use XPCOM/Thunderbird-internal APIs in the experiment context for a few things, but the long-term direction is to minimize that and build on the official WebExtension surface.
-
-## Security
-
-The extension only listens on localhost, but any local process can access it while Thunderbird is running. Keep this in mind on shared machines.
-
-## Troubleshooting
-
-**Extension not loading?**
-Check Tools → Add-ons and Themes. For errors: Tools → Developer Tools → Error Console.
-
-**Connection refused?**
-Make sure Thunderbird is running and the extension is enabled.
-
-**Can't find recent emails?**
-IMAP folders can be stale. Click on the folder in Thunderbird to sync, or right-click → Properties → Repair Folder.
-
-## Development
-
-```bash
-# Build the extension
-./scripts/build.sh
-
-# Test the HTTP API directly
-curl -X POST http://localhost:8765 \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-
-# Test the bridge
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | node mcp-bridge.cjs
-```
-
-After changing extension code, you'll need to remove it from Thunderbird, restart, reinstall, and restart again. Thunderbird caches aggressively.
-
-## Known issues / TODO
-
-- IMAP folder databases can be stale until you click on them
-- Email bodies with weird control characters get sanitized to avoid breaking JSON
-
-(Several earlier TODOs have been implemented in this fork, including robust draft revision and improved search tooling.)
-
-## Project structure
-
-```
-thunderbird-mcp/
-├── mcp-bridge.cjs              # stdio-to-HTTP bridge
-├── extension/
-│   ├── manifest.json
-│   ├── background.js           # Extension entry point
-│   ├── httpd.sys.mjs           # Mozilla's HTTP server lib
-│   └── mcp_server/
-│       ├── api.js              # The actual MCP implementation
-│       └── schema.json
-└── scripts/
-    ├── build.sh
-    └── install.sh
-```
-
-## License
-
-MIT. The bundled `httpd.sys.mjs` is from Mozilla and licensed under MPL-2.0.
+The build writes `dist/thunderbird-mcp.xpi`. The bridge and extension use upstream's authenticated loopback transport. For transport details and the inherited read and organization tools, see the [upstream v0.10.0 documentation](https://github.com/TKasperczyk/thunderbird-mcp/blob/v0.10.0/README.md). The policy above applies to this fork.

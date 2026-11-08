@@ -1,0 +1,3264 @@
+/**
+ * Validation tests for new tool schemas added in this PR.
+ *
+ * Since the validation function runs inside the Thunderbird extension context,
+ * we replicate the exact same logic here to verify it independently. Contact
+ * schemas are VM-extracted from production buildTools() so these tests cannot
+ * drift from the nested fields actually exposed by the extension.
+ *
+ * Covers:
+ * - Tag operations (addTags/removeTags on updateMessage, tag filter on searchMessages)
+ * - Folder management (renameFolder, deleteFolder, moveFolder)
+ * - Attachment sending (file paths and inline base64 objects)
+ * - Contact write operations (createContact, updateContact, deleteContact)
+ */
+
+const { describe, it } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const { makeDirectSendPrefs, prefTypes, clearOriginalRawFixture, composeHeaderParser } = require('./helpers/direct-send-prefs.cjs');
+
+const apiSource = fs.readFileSync(
+  path.resolve(__dirname, '../extension/mcp_server/api.js'),
+  'utf8'
+);
+
+function getMarkedApiSnippet(startMarker, endMarker) {
+  const start = apiSource.indexOf(startMarker);
+  const end = apiSource.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0, `api.js marker missing: ${startMarker}`);
+  assert.ok(end > start, `api.js marker missing: ${endMarker}`);
+  return apiSource.slice(start, end);
+}
+
+const messageHeaderLimits = getMarkedApiSnippet('// BEGIN MESSAGE HEADER LIMITS', '// END MESSAGE HEADER LIMITS');
+
+function loadProductionAttachmentValidation(overrides = {}, transform = code => code) {
+  const sandbox = {
+    ...clearOriginalRawFixture,
+    getConfiguredGetMessagesLimit: () => 20,
+    _tempAttachFiles: new Set(),
+    _tempFileCounter: 0,
+    Cc: { '@mozilla.org/messengercompose/attachment;1': { createInstance: () => ({}) } },
+    Ci: {},
+    ...overrides,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(transform([
+    getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
+    getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
+    getMarkedApiSnippet('// BEGIN THUNDERBIRD PROFILE ROOTS', '// END THUNDERBIRD PROFILE ROOTS'),
+    getMarkedApiSnippet('// BEGIN NATIVE ATTACHMENT CONVERSION', '// END NATIVE ATTACHMENT CONVERSION'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND ENCRYPTION GUARD', '// END DIRECT SEND ENCRYPTION GUARD'),
+    getMarkedApiSnippet('// BEGIN DIRECT SEND ORIGINAL GUARD', '// END DIRECT SEND ORIGINAL GUARD'),
+    getMarkedApiSnippet('// BEGIN OUTBOUND MAIL TOOLS', '// END OUTBOUND MAIL TOOLS'),
+    getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
+    messageHeaderLimits,
+    getMarkedApiSnippet('// BEGIN SEARCH RESULT LIMITS', '// END SEARCH RESULT LIMITS'),
+    getMarkedApiSnippet('// BEGIN CONTACT FIELD CONSTANTS', '// END CONTACT FIELD CONSTANTS'),
+    getMarkedApiSnippet('// BEGIN FILTER SEARCH TERM HELPERS', '// END FILTER SEARCH TERM HELPERS'),
+    getMarkedApiSnippet('// BEGIN BOUNDED REFRESH HELPERS', '// END BOUNDED REFRESH HELPERS'),
+    getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
+    getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
+    getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT CONVERSION', '// END OUTBOUND ATTACHMENT CONVERSION'),
+    getMarkedApiSnippet('// BEGIN ATTACHMENT EXPORT DIRECTORY', '// END ATTACHMENT EXPORT DIRECTORY'),
+    getMarkedApiSnippet('// BEGIN COMPOSE ACCOUNT KEY', '// END COMPOSE ACCOUNT KEY'),
+    getMarkedApiSnippet('// BEGIN COMPOSE SIZE GUARD', '// END COMPOSE SIZE GUARD'),
+    'Object.assign(this, { composeMail, saveDraft, replyToMessage, forwardMessage, isSensitiveFilePath, ensureAttachmentDir, descsToMsgAttachments, addAttachmentsToComposeWindow });',
+    'this.isValidBase64 = isValidBase64;',
+    'this.buildTools = buildTools;',
+    'this.validateAgainstSchema = validateAgainstSchema;',
+    'this.filePathsToAttachDescs = filePathsToAttachDescs;',
+    'this.dryRunCompose = dryRunCompose;',
+    'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
+    'this.maxHeaderBatchIds = MAX_HEADER_BATCH_IDS;',
+  ].join('\n')), sandbox);
+  if (sandbox.server) {
+    vm.runInContext([
+      getMarkedApiSnippet('// BEGIN INLINE IMAGE CONTENT HELPERS', '// END INLINE IMAGE CONTENT HELPERS'),
+      getMarkedApiSnippet('// BEGIN MCP TEXT SANITIZATION', '// END MCP TEXT SANITIZATION'),
+      getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'),
+      getMarkedApiSnippet('// BEGIN MCP HTTP HANDLER', '// END MCP HTTP HANDLER')
+        .replace(/\/\/ BEGIN FORK HTTP POLICY[\s\S]*?\/\/ END FORK HTTP POLICY/, '')
+        .replace(/\/\/ BEGIN FORK HTTP DRAFT ARGUMENTS[\s\S]*?\/\/ END FORK HTTP DRAFT ARGUMENTS/, ''),
+    ].join('\n'), sandbox);
+  }
+  return sandbox;
+}
+
+const productionAttachmentValidation = loadProductionAttachmentValidation();
+
+const productionToolArgs = {
+  sendMail: { to: 'user@example.com', subject: 'test', body: 'hello' },
+  saveDraft: {},
+  replyToMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', body: 'hello' },
+  forwardMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', to: 'user@example.com' },
+};
+
+function validateProductionToolArgs(name, args) {
+  const tool = productionAttachmentValidation.buildTools().find(t => t.name === name);
+  assert.ok(tool, `production tool schema missing: ${name}`);
+  const schema = tool.inputSchema;
+  const errors = [];
+  for (const key of schema.required || []) {
+    if (args[key] === undefined || args[key] === null) {
+      errors.push(`Missing required parameter: ${key}`);
+    }
+  }
+  for (const [key, value] of Object.entries(args)) {
+    const propSchema = schema.properties?.[key];
+    if (!propSchema) {
+      errors.push(`Unknown parameter: ${key}`);
+      continue;
+    }
+    productionAttachmentValidation.validateAgainstSchema(value, propSchema, key, errors);
+    if (propSchema.type === 'array' && Array.isArray(value)) {
+      if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
+        errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
+      }
+      if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
+        errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+      }
+    }
+  }
+  return errors;
+}
+
+function loadProductionContactTools() {
+  const source = apiSource;
+  const constantsStart = source.indexOf('const CONTACT_PHONE_TYPES =');
+  const constantsEnd = source.indexOf('const CONTACT_ADDRESS_FIELDS =', constantsStart);
+  const buildToolsStart = source.indexOf('function buildTools()');
+  const fieldsStart = source.indexOf('const contactFieldProperties =', buildToolsStart);
+  const fieldsEnd = source.indexOf('\n      const definitions = [', fieldsStart);
+  const getContactName = source.indexOf('name: "getContact"', fieldsEnd);
+  const contactToolsStart = source.lastIndexOf('      {', getContactName);
+  const deleteContactName = source.indexOf('name: "deleteContact"', getContactName);
+  const contactToolsEnd = source.lastIndexOf('      {', deleteContactName);
+
+  assert.ok(constantsStart >= 0 && constantsEnd > constantsStart,
+    'production contact type constants missing');
+  assert.ok(fieldsStart >= 0 && fieldsEnd > fieldsStart,
+    'production contact field schemas missing from buildTools()');
+  assert.ok(contactToolsStart >= 0 && contactToolsEnd > contactToolsStart,
+    'production contact tool schemas missing from buildTools()');
+
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext(`
+${source.slice(constantsStart, constantsEnd)}
+${source.slice(fieldsStart, fieldsEnd)}
+this.contactTools = [
+${source.slice(contactToolsStart, contactToolsEnd)}
+];`, sandbox);
+
+  return {
+    source,
+    tools: sandbox.contactTools,
+  };
+}
+
+const productionContacts = loadProductionContactTools();
+
+/**
+ * Exact copy of validateToolArgs / validateAgainstSchema from api.js.
+ * Kept in sync manually — if the logic in api.js changes, update here too.
+ */
+function validateAgainstSchema(value, schema, path, errors) {
+  if (!schema || value === undefined || value === null) return;
+
+  const expectedType = schema.type;
+  if (expectedType === "array") {
+    if (!Array.isArray(value)) {
+      errors.push(`Parameter '${path}' must be an array, got ${typeof value}`);
+      return;
+    }
+    if (schema.items) {
+      for (let i = 0; i < value.length; i++) {
+        if (value[i] === null || value[i] === undefined) {
+          errors.push(`Parameter '${path}[${i}]' must not be null`);
+          continue;
+        }
+        validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
+      }
+    }
+  } else if (expectedType === "object") {
+    if (typeof value !== "object" || Array.isArray(value)) {
+      errors.push(`Parameter '${path}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
+      return;
+    }
+    const nestedProps = schema.properties || {};
+    const nestedRequired = schema.required || [];
+    const hasPreferredBase64 = value.base64 !== undefined
+      && value.base64 !== null
+      && nestedProps.base64?.contentEncoding === "base64"
+      && nestedProps.content?.contentEncoding === "base64";
+    for (const r of nestedRequired) {
+      if (value[r] === undefined || value[r] === null) {
+        errors.push(`Missing required parameter: ${path}.${r}`);
+      }
+    }
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "content" && hasPreferredBase64) continue;
+      const has = Object.prototype.hasOwnProperty.call(nestedProps, k);
+      if (!has) {
+        if (schema.additionalProperties === false) {
+          errors.push(`Unknown parameter: ${path}.${k}`);
+        }
+        continue;
+      }
+      validateAgainstSchema(v, nestedProps[k], `${path}.${k}`, errors);
+    }
+  } else if (expectedType === "integer") {
+    if (typeof value !== "number" || !Number.isInteger(value)) {
+      errors.push(`Parameter '${path}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
+      return;
+    }
+  } else if (expectedType && typeof value !== expectedType) {
+    errors.push(`Parameter '${path}' must be ${expectedType}, got ${typeof value}`);
+    return;
+  }
+
+  if (expectedType === "string") {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+      errors.push(`Parameter '${path}' must contain at least ${schema.minLength} character(s)`);
+    }
+    if (schema.contentEncoding === "base64" && !productionAttachmentValidation.isValidBase64(value)) {
+      errors.push(`Parameter '${path}' must contain valid base64 data`);
+    }
+  }
+
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+    let matched = 0;
+    const branchFailures = [];
+    for (const branch of schema.anyOf) {
+      const branchErrors = [];
+      validateAgainstSchema(value, branch, path, branchErrors);
+      if (branchErrors.length === 0) matched++;
+      else branchFailures.push(branchErrors);
+    }
+    if (matched === 0) {
+      const details = [...new Set(branchFailures.flat())].join("; ");
+      errors.push(`Parameter '${path}' did not match any required schema alternative${details ? `: ${details}` : ""}`);
+    }
+  }
+
+  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+    let matched = 0;
+    const branchFailures = [];
+    for (const branch of schema.oneOf) {
+      const branchErrors = [];
+      validateAgainstSchema(value, branch, path, branchErrors);
+      if (branchErrors.length === 0) matched++;
+      else branchFailures.push(branchErrors);
+    }
+    if (matched === 0) {
+      const details = [...new Set(branchFailures.flat())].join("; ");
+      errors.push(`Parameter '${path}' did not match any allowed schema variant${details ? `: ${details}` : ""}`);
+    } else if (matched > 1) {
+      errors.push(`Parameter '${path}' matched more than one schema variant`);
+    }
+  }
+
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    errors.push(`Parameter '${path}' must be one of ${JSON.stringify(schema.enum)}, got ${JSON.stringify(value)}`);
+  }
+}
+
+function createValidator(tools) {
+  const toolSchemas = Object.create(null);
+  for (const t of tools) {
+    toolSchemas[t.name] = t.inputSchema;
+  }
+
+  return function validateToolArgs(name, args) {
+    const schema = toolSchemas[name];
+    if (!schema) return [`Unknown tool: ${name}`];
+
+    const errors = [];
+    const props = schema.properties || {};
+    const required = schema.required || [];
+
+    for (const key of required) {
+      if (args[key] === undefined || args[key] === null) {
+        errors.push(`Missing required parameter: ${key}`);
+      }
+    }
+
+    for (const [key, value] of Object.entries(args)) {
+      const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
+      if (!propSchema) {
+        errors.push(`Unknown parameter: ${key}`);
+        continue;
+      }
+      if (value === undefined || value === null) continue;
+
+      // Array length bounds (minItems/maxItems) sit outside validateAgainstSchema;
+      // reject over-cap arrays before walking their items, as in production.
+      if (propSchema.type === "array" && Array.isArray(value)) {
+        if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
+          errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
+        }
+        if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
+          errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+          continue;
+        }
+      }
+      validateAgainstSchema(value, propSchema, key, errors);
+    }
+
+    return errors;
+  };
+}
+
+const HEADER_BATCH_TOOL = 'batchGetMessageHeaders';
+const MAX_HEADER_BATCH_IDS = productionAttachmentValidation.maxHeaderBatchIds;
+
+const sampleTools = [
+  {
+    name: "searchMessages",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        folderPath: { type: "string" },
+        maxResults: { type: "number" },
+        offset: { type: "number" },
+        unreadOnly: { type: "boolean" },
+        tag: { type: "string" },
+        dedupByMessageId: { type: "boolean" },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "sendMail",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string" },
+        subject: { type: "string" },
+        body: { type: "string" },
+        attachments: {
+          type: "array",
+          items: {
+            oneOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  name: { type: "string", minLength: 1 },
+                  contentType: { type: "string" },
+                  base64: { type: "string", minLength: 1, contentEncoding: "base64" },
+                  content: { type: "string", minLength: 1, contentEncoding: "base64" },
+                },
+                required: ["name"],
+                anyOf: [
+                  { type: "object", required: ["base64"] },
+                  { type: "object", required: ["content"] },
+                ],
+                additionalProperties: false,
+              },
+            ],
+          },
+        },
+      },
+      required: ["to", "subject", "body"],
+    },
+  },
+  ...productionContacts.tools,
+  {
+    name: "deleteContact",
+    inputSchema: {
+      type: "object",
+      properties: {
+        contactId: { type: "string" },
+      },
+      required: ["contactId"],
+    },
+  },
+  {
+    name: "renameFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+        newName: { type: "string" },
+      },
+      required: ["folderPath", "newName"],
+    },
+  },
+  {
+    name: "deleteFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+      },
+      required: ["folderPath"],
+    },
+  },
+  {
+    name: "moveFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+        newParentPath: { type: "string" },
+      },
+      required: ["folderPath", "newParentPath"],
+    },
+  },
+  {
+    name: "updateMessage",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        messageIds: { type: "array", items: { type: "string" } },
+        folderPath: { type: "string" },
+        read: { type: "boolean" },
+        flagged: { type: "boolean" },
+        addTags: { type: "array", items: { type: "string" } },
+        removeTags: { type: "array", items: { type: "string" } },
+        moveTo: { type: "string" },
+        trash: { type: "boolean" },
+      },
+      required: ["folderPath"],
+    },
+  },
+  {
+    name: "getMessages",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messages: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          items: {
+            type: "object",
+            properties: {
+              messageId: { type: "string" },
+              folderPath: { type: "string" },
+            },
+            required: ["messageId", "folderPath"],
+          },
+        },
+        saveAttachments: { type: "boolean" },
+        bodyFormat: { type: "string" },
+        rawSource: { type: "boolean" },
+      },
+      required: ["messages"],
+    },
+  },
+  {
+    name: "getMessageHeaders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        folderPath: { type: "string" },
+      },
+      required: ["messageId", "folderPath"],
+    },
+  },
+  {
+    name: HEADER_BATCH_TOOL,
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageIds: {
+          type: "array",
+          maxItems: MAX_HEADER_BATCH_IDS,
+          items: { type: "string", minLength: 1 },
+        },
+        folderPath: { type: "string" },
+      },
+      required: ["messageIds", "folderPath"],
+    },
+  },
+  {
+    name: "getAccountAccess",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+];
+
+const validate = createValidator(sampleTools);
+
+describe('Validation: updateMessage with tags', () => {
+  it('accepts addTags as array', () => {
+    const errors = validate('updateMessage', {
+      folderPath: 'imap://user@server/INBOX',
+      addTags: ['$label1', '$label2'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts removeTags as array', () => {
+    const errors = validate('updateMessage', {
+      folderPath: 'imap://user@server/INBOX',
+      removeTags: ['$label1'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects addTags as string', () => {
+    const errors = validate('updateMessage', {
+      folderPath: 'imap://user@server/INBOX',
+      addTags: '$label1',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects removeTags as number', () => {
+    const errors = validate('updateMessage', {
+      folderPath: 'imap://user@server/INBOX',
+      removeTags: 42,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('accepts tag filter as string in searchMessages', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      tag: '$label1',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects tag filter as number in searchMessages', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      tag: 42,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('accepts dedupByMessageId as boolean in searchMessages', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      dedupByMessageId: false,
+    });
+    assert.equal(errors.length, 0);
+  });
+});
+
+describe('Validation: pagination parameters', () => {
+  it('accepts offset as number', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 50,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects offset as string', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 'fifty',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be number/);
+  });
+
+  it('accepts offset=0', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 0,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts offset with maxResults', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 100,
+      maxResults: 50,
+    });
+    assert.equal(errors.length, 0);
+  });
+});
+
+describe('Validation: folder management', () => {
+  it('renameFolder requires both params', () => {
+    const errors = validate('renameFolder', {});
+    assert.equal(errors.length, 2);
+    assert.ok(errors.some(e => e.includes('folderPath')));
+    assert.ok(errors.some(e => e.includes('newName')));
+  });
+
+  it('renameFolder accepts valid params', () => {
+    const errors = validate('renameFolder', {
+      folderPath: 'imap://user@server/INBOX/Old',
+      newName: 'New',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('renameFolder rejects number for newName', () => {
+    const errors = validate('renameFolder', {
+      folderPath: 'imap://user@server/INBOX/Old',
+      newName: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('deleteFolder requires folderPath', () => {
+    const errors = validate('deleteFolder', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /folderPath/);
+  });
+
+  it('deleteFolder accepts valid path', () => {
+    const errors = validate('deleteFolder', {
+      folderPath: 'imap://user@server/INBOX/ToDelete',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('moveFolder requires both params', () => {
+    const errors = validate('moveFolder', {});
+    assert.equal(errors.length, 2);
+  });
+
+  it('moveFolder accepts valid params', () => {
+    const errors = validate('moveFolder', {
+      folderPath: 'imap://user@server/INBOX/Source',
+      newParentPath: 'imap://user@server/Archive',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('moveFolder rejects unknown params', () => {
+    const errors = validate('moveFolder', {
+      folderPath: '/Source',
+      newParentPath: '/Dest',
+      recursive: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+function makeMockLocalFile(attachmentPath, options = {}) {
+  const {
+    exists = true,
+    normalizedPath = attachmentPath,
+    normalizeError = null,
+    symlink = false,
+    symlinkError = null,
+    regularFile = true,
+    typeError = null,
+    size = 1,
+    sizeError = null,
+  } = options;
+  return {
+    path: attachmentPath,
+    leafName: attachmentPath.split(/[\\/]/).pop(),
+    parent: options.parent || null,
+    clone() { return makeMockLocalFile(this.path, options); },
+    initWithPath(value) { this.path = value; },
+    isReadable() {
+      if (options.readError) throw options.readError;
+      this.resolved = true;
+      return true;
+    },
+    get target() { return this.resolved ? (options.target || this.path) : this.path; },
+    exists() {
+      return exists;
+    },
+    isSymlink() {
+      if (symlinkError) throw symlinkError;
+      return symlink;
+    },
+    normalize() {
+      if (normalizeError) throw normalizeError;
+      this.path = normalizedPath;
+    },
+    isFile() {
+      if (typeError) throw typeError;
+      return regularFile;
+    },
+    get fileSize() {
+      if (sizeError) throw sizeError;
+      return size;
+    },
+  };
+}
+
+function convertProductionFileAttachments(entries, files) {
+  const runtime = loadProductionAttachmentValidation({
+    createLocalFile(attachmentPath) {
+      const file = files.get(attachmentPath);
+      if (!file) throw new Error(`missing mock file: ${attachmentPath}`);
+      return file;
+    },
+    Services: {
+      io: {
+        newFileURI: file => ({ spec: `file://${file.path}` }),
+      },
+    },
+  });
+  return {
+    limits: runtime.attachmentLimits,
+    result: runtime.filePathsToAttachDescs(entries),
+  };
+}
+
+const REFRESH_TEST_FOLDER_URI = 'imap://user@server/INBOX';
+const REFRESH_TEST_FRACTIONAL_TIMEOUT_MS = 1500.5;
+const REFRESH_TEST_STRING_TIMEOUT_MS = '15000';
+
+describe('Validation: refreshFolder', () => {
+  it('requires folderPath', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter/);
+    assert.match(errors[0], /folderPath/);
+  });
+
+  it('accepts a valid folderPath alone', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts a valid folderPath with integer timeoutMs', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      timeoutMs: 20000,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects number for folderPath', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects non-integer timeoutMs', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      timeoutMs: REFRESH_TEST_FRACTIONAL_TIMEOUT_MS,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string timeoutMs', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      timeoutMs: REFRESH_TEST_STRING_TIMEOUT_MS,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown params', () => {
+    const errors = validateProductionToolArgs('refreshFolder', {
+      folderPath: REFRESH_TEST_FOLDER_URI,
+      force: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: refreshCalendar production schema', () => {
+  it('accepts omitted arguments for all enabled refreshable calendars', () => {
+    assert.equal(validateProductionToolArgs('refreshCalendar', {}).length, 0);
+  });
+
+  it('accepts a calendar ID and an integer wait budget', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', {
+      calendarId: 'calendar-a', timeoutMs: 5000,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects a non-string calendar ID', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { calendarId: 123 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /calendarId.*must be string/);
+  });
+
+  it('rejects a non-integer wait budget', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { timeoutMs: REFRESH_TEST_FRACTIONAL_TIMEOUT_MS });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /timeoutMs.*must be an integer/);
+  });
+
+  it('rejects a string wait budget', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { timeoutMs: REFRESH_TEST_STRING_TIMEOUT_MS });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /timeoutMs.*must be an integer/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validateProductionToolArgs('refreshCalendar', { force: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter.*force/);
+  });
+
+  it('advertises the same bounded wait and preserves each refresh tool access group', () => {
+    const schemas = productionAttachmentValidation.buildTools();
+    for (const [name, group] of [['refreshFolder', 'messages'], ['refreshCalendar', 'calendar']]) {
+      const tool = schemas.find(candidate => candidate.name === name);
+      assert.equal(tool.group, group);
+      assert.equal(tool.crud, 'read');
+      const timeout = tool.inputSchema.properties.timeoutMs;
+      assert.equal(timeout.type, 'integer');
+      assert.equal(timeout.minimum, 1000);
+      assert.equal(timeout.maximum, 25000);
+    }
+  });
+});
+
+describe('Validation: attachment sending', () => {
+  it('accepts attachments as array of strings (file paths)', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: ['/path/to/file.pdf'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts attachments as array of objects (inline base64)', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', contentType: 'application/pdf', base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts mixed attachment types', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: ['/path/to/file.pdf', { name: 'img.png', base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects attachments as string', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: '/path/to/file.pdf',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  // Regression: the runtime accepts `content` as an alias for `base64`
+  // (entry.base64 || entry.content). Validation must not reject {name, content}.
+  it('accepts inline attachment using `content` as a base64 alias', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', content: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // Regression: contentType is optional at runtime; {name, base64} must pass.
+  it('accepts inline attachment with base64 and no contentType', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // base64 + content together is accepted (runtime lets base64 win); validation
+  // must not inspect malformed content when the preferred base64 is valid.
+  it('accepts inline attachment with valid base64 and malformed content', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', base64: 'AAAA', content: '%%%%' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects inline attachment missing name', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /did not match any allowed schema variant/);
+  });
+
+  it('rejects inline attachment with unknown property', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', base64: 'AAAA', evil: 'x' }],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /did not match any allowed schema variant/);
+  });
+
+  // Regression: validateAgainstSchema returns early on null, so a null array
+  // item used to skip the item schema entirely. Must be rejected explicitly.
+  it('rejects a null attachment item', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [null],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must not be null/);
+  });
+
+
+
+  for (const [toolName, requiredArgs] of Object.entries(productionToolArgs)) {
+    it(`production ${toolName} schema rejects payload-less and empty inline attachments`, () => {
+      for (const attachment of [
+        { name: 'empty.bin' },
+        { name: 'empty.bin', base64: '' },
+        { name: 'empty.bin', content: '' },
+      ]) {
+        const errors = validateProductionToolArgs(toolName, {
+          ...requiredArgs,
+          attachments: [attachment],
+        });
+        assert.ok(errors.length > 0, `${toolName} accepted ${JSON.stringify(attachment)}`);
+      }
+    });
+
+    it(`production ${toolName} schema accepts non-empty base64 and content payloads`, () => {
+      for (const attachment of [
+        { name: 'file.bin', contentType: 'application/octet-stream', base64: 'AAAA' },
+        { name: 'file.bin', contentType: 'application/octet-stream', content: 'AAAA' },
+      ]) {
+        const errors = validateProductionToolArgs(toolName, {
+          ...requiredArgs,
+          attachments: [attachment],
+        });
+        assert.deepEqual(errors, [], `${toolName} rejected ${JSON.stringify(attachment)}: ${errors.join('; ')}`);
+      }
+    });
+
+    it(`production ${toolName} schema honors base64 precedence`, () => {
+      const errors = validateProductionToolArgs(toolName, {
+        ...requiredArgs,
+        attachments: [{ name: 'file.bin', base64: 'AAAA', content: '%%%%' }],
+      });
+      assert.deepEqual(errors, []);
+    });
+
+    it(`production ${toolName} schema rejects an empty attachment name`, () => {
+      const errors = validateProductionToolArgs(toolName, {
+        ...requiredArgs,
+        attachments: [{ name: '', base64: 'AAAA' }],
+      });
+      assert.ok(errors.some(error => /at least 1 character/.test(error)), errors.join('; '));
+    });
+  }
+
+  it('production validation rejects malformed base64 with a clear error', () => {
+    const errors = validateProductionToolArgs('sendMail', {
+      ...productionToolArgs.sendMail,
+      attachments: [{ name: 'garbage.bin', base64: '%%%%' }],
+    });
+    assert.ok(errors.some(error => /valid base64 data/.test(error)), errors.join('; '));
+  });
+
+  it('production runtime rejects malformed base64 before decoding it', () => {
+    assert.throws(() => productionAttachmentValidation.filePathsToAttachDescs([
+      { name: 'garbage.bin', base64: '%%%%' },
+    ]), /garbage\.bin \(invalid base64 data\)/);
+  });
+
+  it('production schemas and runtime enforce the per-message attachment count cap', () => {
+    const maxCount = productionAttachmentValidation.attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE;
+    const entries = Array.from({ length: maxCount + 1 }, (_, index) => `/tmp/file-${index}.txt`);
+    for (const [toolName, requiredArgs] of Object.entries(productionToolArgs)) {
+      const errors = validateProductionToolArgs(toolName, {
+        ...requiredArgs,
+        attachments: entries,
+      });
+      assert.ok(
+        errors.some(error => error.includes(`at most ${maxCount}`)),
+        `${toolName}: ${errors.join('; ')}`
+      );
+    }
+
+    const files = new Map(entries.map(entry => [entry, makeMockLocalFile(entry)]));
+    assert.throws(() => convertProductionFileAttachments(entries, files),
+      new RegExp(`Attachment count ${maxCount + 1} exceeds the ${maxCount} attachment limit`));
+  });
+
+  it('production runtime enforces a 50MB aggregate attachment cap', () => {
+    const mib = 1024 * 1024;
+    const entries = ['/tmp/first.bin', '/tmp/second.bin', '/tmp/over.bin'];
+    const files = new Map([
+      [entries[0], makeMockLocalFile(entries[0], { size: 30 * mib })],
+      [entries[1], makeMockLocalFile(entries[1], { size: 20 * mib })],
+      [entries[2], makeMockLocalFile(entries[2], { size: 1 })],
+    ]);
+    const { limits, result } = convertProductionFileAttachments(entries.slice(0, 2), files);
+    assert.equal(limits.MAX_TOTAL_ATTACHMENT_BYTES, 50 * mib);
+    assert.equal(result.descs.length, 2, 'attachments exactly at the aggregate cap should pass');
+    assert.equal(result.descs.reduce((total, desc) => total + desc.size, 0), 50 * mib);
+    assert.throws(() => convertProductionFileAttachments(entries, files), /over\.bin \(exceeds 50MB aggregate attachment limit\)/);
+  });
+
+  it('production runtime fails closed on normalization, type, and size checks', () => {
+    const entries = [
+      '/tmp/normalize.bin',
+      '/tmp/type.bin',
+      '/tmp/directory',
+      '/tmp/size.bin',
+      '/tmp/invalid-size.bin',
+    ];
+    const files = new Map([
+      [entries[0], makeMockLocalFile(entries[0], { normalizeError: new Error('normalize failed') })],
+      [entries[1], makeMockLocalFile(entries[1], { typeError: new Error('stat failed') })],
+      [entries[2], makeMockLocalFile(entries[2], { regularFile: false })],
+      [entries[3], makeMockLocalFile(entries[3], { sizeError: new Error('stat failed') })],
+      [entries[4], makeMockLocalFile(entries[4], { size: Number.NaN })],
+    ]);
+    assert.throws(() => convertProductionFileAttachments(entries, files), error => {
+      assert.match(error.message, /normalize\.bin \(path normalization failed\)/);
+      assert.match(error.message, /type\.bin \(file type check failed\)/);
+      assert.match(error.message, /directory \(not a regular file\)/);
+      assert.match(error.message, /size\.bin \(file size check failed\)/);
+      assert.match(error.message, /invalid-size\.bin \(invalid file size\)/);
+      return true;
+    });
+  });
+
+  it('production runtime rejects symlinks and fails closed when the check errors', () => {
+    const entries = ['/tmp/symlink.bin', '/tmp/symlink-check.bin'];
+    const files = new Map([
+      [entries[0], makeMockLocalFile(entries[0], { symlink: true })],
+      [entries[1], makeMockLocalFile(entries[1], { symlinkError: new Error('check failed') })],
+    ]);
+
+    assert.throws(() => convertProductionFileAttachments(entries, files), error => {
+      assert.ok(error.message.includes('/tmp/symlink.bin (symlinked path blocked)'));
+      assert.ok(error.message.includes('/tmp/symlink-check.bin (symlink check failed)'));
+      return true;
+    });
+  });
+});
+
+describe('Production contact schemas and dispatch', () => {
+  const toolsByName = new Map(productionContacts.tools.map(tool => [tool.name, tool]));
+  const contactFields = [
+    'email',
+    'emails',
+    'displayName',
+    'firstName',
+    'lastName',
+    'phones',
+    'addresses',
+    'organization',
+    'title',
+    'note',
+    'birthday',
+  ];
+
+  it('extracts the complete nested schemas from buildTools()', () => {
+    const getSchema = toolsByName.get('getContact').inputSchema;
+    const createSchema = toolsByName.get('createContact').inputSchema;
+    const updateSchema = toolsByName.get('updateContact').inputSchema;
+
+    assert.deepEqual(Object.keys(getSchema.properties), ['contactId']);
+    assert.deepEqual(Array.from(getSchema.required), ['contactId']);
+    assert.deepEqual(Object.keys(createSchema.properties), [...contactFields, 'addressBookId']);
+    assert.deepEqual(Array.from(createSchema.required), []);
+    assert.deepEqual(Object.keys(updateSchema.properties), ['contactId', ...contactFields]);
+    assert.deepEqual(Array.from(updateSchema.required), ['contactId']);
+
+    for (const schema of [createSchema, updateSchema]) {
+      const emailItems = schema.properties.emails.items;
+      assert.deepEqual(Object.keys(emailItems.properties), ['type', 'address']);
+      assert.deepEqual(Array.from(emailItems.properties.type.enum), ['work', 'home']);
+      assert.deepEqual(Array.from(emailItems.required), ['address']);
+      assert.equal(emailItems.additionalProperties, false);
+
+      const phoneItems = schema.properties.phones.items;
+      assert.deepEqual(Object.keys(phoneItems.properties), ['type', 'number']);
+      assert.deepEqual(Array.from(phoneItems.properties.type.enum), [
+        'work', 'home', 'mobile', 'fax', 'pager',
+      ]);
+      assert.deepEqual(Array.from(phoneItems.required), ['type', 'number']);
+      assert.equal(phoneItems.additionalProperties, false);
+
+      const addressItems = schema.properties.addresses.items;
+      assert.deepEqual(Object.keys(addressItems.properties), [
+        'type',
+        'poBox',
+        'street',
+        'street2',
+        'city',
+        'region',
+        'postalCode',
+        'country',
+      ]);
+      assert.deepEqual(Array.from(addressItems.properties.type.enum), ['home', 'work']);
+      assert.deepEqual(Array.from(addressItems.required), ['type']);
+      assert.equal(addressItems.additionalProperties, false);
+    }
+  });
+
+  it('passes contact arguments to handlers in production schema order', async () => {
+    const calls = [];
+    const names = ['getContact', 'createContact', 'updateContact'];
+    const runtime = vm.createContext(Object.fromEntries(names.map(name => [
+      name, (...args) => { calls.push({ name, args }); return name; },
+    ])));
+    vm.runInContext(getMarkedApiSnippet('// BEGIN TOOL DISPATCH', '// END TOOL DISPATCH'), runtime);
+    for (const name of names) {
+      const fields = Object.keys(toolsByName.get(name).inputSchema.properties);
+      const args = Object.fromEntries(fields.map(field => [field, `value:${field}`]));
+      assert.equal(await runtime.dispatchTool(name, args), name);
+      assert.deepEqual(calls.pop(), { name, args: fields.map(field => args[field]) });
+    }
+  });
+});
+
+describe('Validation: contact write operations', () => {
+  it('createContact no longer requires email at the schema layer', () => {
+    const errors = validate('createContact', {});
+    assert.equal(errors.length, 0);
+  });
+
+  it('createContact accepts all structured contact fields', () => {
+    const errors = validate('createContact', {
+      displayName: 'Test User',
+      phones: [{ type: 'mobile', number: '+48 123 456 789' }],
+      addresses: [{ type: 'work', street: '1 Main St', city: 'Warsaw' }],
+      organization: 'Example Corp',
+      title: 'Engineer',
+      note: 'first line\nsecond line',
+      birthday: '--04-15',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('createContact rejects number for email', () => {
+    const errors = validate('createContact', {
+      email: 12345,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('createContact deep-validates phone and address item schemas', () => {
+    const phoneErrors = validate('createContact', {
+      phones: [{ type: 'cell', number: '123' }],
+    });
+    assert.ok(phoneErrors.some(error => /must be one of/.test(error)));
+
+    const addressErrors = validate('createContact', {
+      addresses: [{ type: 'home', city: 'Warsaw', label: 'private' }],
+    });
+    assert.ok(addressErrors.some(error => /Unknown parameter: addresses\[0\]\.label/.test(error)));
+  });
+
+  it('createContact accepts typed and untyped email items and deep-validates them', () => {
+    assert.deepEqual(validate('createContact', {
+      emails: [
+        { address: 'ada@example.com' },
+        { type: 'home', address: 'ada@home.example' },
+      ],
+    }), []);
+
+    const typeErrors = validate('createContact', {
+      emails: [{ type: 'other', address: 'ada@example.com' }],
+    });
+    assert.ok(typeErrors.some(error => /must be one of/.test(error)));
+
+    const unknownErrors = validate('createContact', {
+      emails: [{ address: 'ada@example.com', label: 'private' }],
+    });
+    assert.ok(unknownErrors.some(error => /Unknown parameter: emails\[0\]\.label/.test(error)));
+  });
+
+  it('getContact requires a contactId', () => {
+    const missing = validate('getContact', {});
+    assert.equal(missing.length, 1);
+    assert.match(missing[0], /contactId/);
+    assert.deepEqual(validate('getContact', { contactId: 'uid-123' }), []);
+  });
+
+  it('updateContact requires contactId', () => {
+    const errors = validate('updateContact', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /contactId/);
+  });
+
+  it('updateContact accepts contactId with optional fields', () => {
+    const errors = validate('updateContact', {
+      contactId: 'uid-123',
+      email: 'new@example.com',
+      firstName: 'New',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('deleteContact requires contactId', () => {
+    const errors = validate('deleteContact', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /contactId/);
+  });
+
+  it('deleteContact accepts valid contactId', () => {
+    const errors = validate('deleteContact', {
+      contactId: 'uid-456',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('deleteContact rejects unknown params', () => {
+    const errors = validate('deleteContact', {
+      contactId: 'uid-456',
+      force: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: account access control', () => {
+  it('getAccountAccess accepts no params', () => {
+    const errors = validate('getAccountAccess', {});
+    assert.equal(errors.length, 0);
+  });
+
+  it('getAccountAccess rejects unknown params', () => {
+    const errors = validate('getAccountAccess', { bogus: 'value' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: getMessages batch size', () => {
+  const messageRef = { messageId: "message-1", folderPath: "imap://user@server/INBOX" };
+
+  it('accepts messages at the configured cap', () => {
+    const errors = validate('getMessages', {
+      messages: Array.from({ length: 10 }, (_, index) => ({
+        ...messageRef,
+        messageId: `message-${index}`,
+      })),
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects empty messages arrays', () => {
+    const errors = validate('getMessages', { messages: [] });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1/);
+  });
+
+  it('rejects messages arrays over the configured cap', () => {
+    const errors = validate('getMessages', {
+      messages: Array.from({ length: 11 }, (_, index) => ({
+        ...messageRef,
+        messageId: `message-${index}`,
+      })),
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at most 10/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests for the recursive validator additions: enum, oneOf branches, nested
+// objects with additionalProperties:false, integer type checks. These cover
+// schema keywords the previous shallow validator silently ignored.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const richValidator = createValidator([
+  {
+    name: 'getMessage',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        messageId: { type: 'string' },
+        folderPath: { type: 'string' },
+        bodyFormat: { type: 'string', enum: ['markdown', 'text', 'html'] },
+        rawSource: { type: 'boolean' },
+        includeInlineImages: { type: 'boolean' },
+      },
+      required: ['messageId', 'folderPath'],
+    },
+  },
+  {
+    name: 'sendMail',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: { type: 'string' },
+        subject: { type: 'string' },
+        body: { type: 'string' },
+        attachments: {
+          type: 'array',
+          items: {
+            oneOf: [
+              { type: 'string' },
+              {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  contentType: { type: 'string' },
+                  base64: { type: 'string' },
+                },
+                required: ['name', 'base64'],
+                additionalProperties: false,
+              },
+            ],
+          },
+        },
+      },
+      required: ['to', 'subject', 'body'],
+    },
+  },
+  {
+    name: 'createTask',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        priority: { type: 'integer' },
+      },
+      required: ['title'],
+    },
+  },
+]);
+
+describe('Validator: enum enforcement', () => {
+  it('accepts an enum value that is in the list', () => {
+    const errors = richValidator('getMessage', {
+      messageId: 'm-1',
+      folderPath: 'imap://x/INBOX',
+      bodyFormat: 'markdown',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects an enum value that is not in the list', () => {
+    const errors = richValidator('getMessage', {
+      messageId: 'm-1',
+      folderPath: 'imap://x/INBOX',
+      bodyFormat: 'docx',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be one of/);
+    assert.match(errors[0], /bodyFormat/);
+  });
+
+  it('enum check still rejects when string type is satisfied but value is off-list', () => {
+    const errors = richValidator('getMessage', {
+      messageId: 'm-1',
+      folderPath: 'imap://x/INBOX',
+      bodyFormat: 'Markdown', // wrong case
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be one of/);
+  });
+});
+
+describe('Validator: getMessage inline images', () => {
+  it('accepts includeInlineImages as a boolean', () => {
+    const errors = richValidator('getMessage', {
+      messageId: 'm-1',
+      folderPath: 'imap://x/INBOX',
+      includeInlineImages: true,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects non-boolean includeInlineImages values', () => {
+    const errors = richValidator('getMessage', {
+      messageId: 'm-1',
+      folderPath: 'imap://x/INBOX',
+      includeInlineImages: 'yes',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /includeInlineImages/);
+    assert.match(errors[0], /must be boolean/);
+  });
+});
+
+describe('Validator: oneOf items (attachments)', () => {
+  it('accepts pure file-path strings', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c',
+      subject: 's',
+      body: 'b',
+      attachments: ['/tmp/a.txt', '/tmp/b.pdf'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts well-formed inline base64 objects', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c',
+      subject: 's',
+      body: 'b',
+      attachments: [{ name: 'a.txt', base64: 'aGk=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects attachment objects missing required fields', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c',
+      subject: 's',
+      body: 'b',
+      attachments: [{ contentType: 'application/pdf' }],
+    });
+    // both branches fail (string branch on type, object branch on missing
+    // required), so oneOf records "did not match any allowed variant"
+    assert.ok(errors.some(e => /did not match any allowed schema variant/.test(e)),
+      `expected oneOf failure, got: ${JSON.stringify(errors)}`);
+  });
+
+  it('rejects attachment objects with extra properties (additionalProperties:false)', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c',
+      subject: 's',
+      body: 'b',
+      attachments: [{ name: 'a.txt', base64: 'aGk=', evil: '../../../etc/passwd' }],
+    });
+    assert.ok(errors.some(e => /did not match any allowed schema variant/.test(e)),
+      `expected oneOf failure when extra props present, got: ${JSON.stringify(errors)}`);
+  });
+
+  it('rejects array entries that are neither strings nor valid objects (e.g. numbers)', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c',
+      subject: 's',
+      body: 'b',
+      attachments: [123],
+    });
+    assert.ok(errors.some(e => /did not match any allowed schema variant/.test(e)));
+  });
+
+  it('flags the failing index in the error path', () => {
+    const errors = richValidator('sendMail', {
+      to: 'a@b.c',
+      subject: 's',
+      body: 'b',
+      attachments: ['/tmp/ok.txt', 123, '/tmp/also-ok.txt'],
+    });
+    assert.ok(errors.some(e => /attachments\[1\]/.test(e)),
+      `expected attachments[1] path, got: ${JSON.stringify(errors)}`);
+  });
+});
+
+describe('Validator: integer type', () => {
+  it('accepts whole numbers for integer fields', () => {
+    const errors = richValidator('createTask', { title: 't', priority: 5 });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects floats for integer fields', () => {
+    const errors = richValidator('createTask', { title: 't', priority: 1.5 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects numeric strings for integer fields (no auto-coerce here)', () => {
+    const errors = richValidator('createTask', { title: 't', priority: '5' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// isSensitiveFilePath: deny-list defending against the LLM-confused-deputy
+// chain (attacker email content → assistant calls sendMail with sensitive
+// attachment path). Tests execute the marked production helper from api.js and
+// run cross-platform against its normalized (lower-cased, forward-slash) form.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function loadProductionSensitivePathHelper() {
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext([
+    getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
+    'this.isSensitiveFilePath = isSensitiveFilePath;',
+  ].join('\n'), sandbox);
+  return sandbox.isSensitiveFilePath;
+}
+
+const isSensitiveFilePath = loadProductionSensitivePathHelper();
+
+describe('isSensitiveFilePath: credential and key files', () => {
+  it('blocks SSH private keys in ~/.ssh/', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.ssh/id_rsa'), true);
+    assert.equal(isSensitiveFilePath('/Users/jordan/.ssh/id_ed25519'), true);
+    assert.equal(isSensitiveFilePath('C:\\Users\\jordan\\.ssh\\id_rsa'), true);
+  });
+
+  it('blocks SSH public keys (still sensitive, contains fingerprint info)', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.ssh/id_rsa.pub'), true);
+  });
+
+  it('blocks the SSH directory listing itself', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.ssh'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.ssh/'), true);
+  });
+
+  it('blocks GnuPG, AWS, Azure, GCloud, kube, docker config dirs', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.gnupg/secring.gpg'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.aws/credentials'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.azure/accessTokens.json'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.config/gcloud/credentials.db'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.kube/config'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.docker/config.json'), true);
+  });
+
+  it('blocks .netrc / .npmrc / .pypirc credential files', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.netrc'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.npmrc'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.pypirc'), true);
+  });
+
+  it('blocks PEM/PFX/P12/KDBX/KEY/ASC/GPG files anywhere on disk', () => {
+    assert.equal(isSensitiveFilePath('/tmp/server.pem'), true);
+    assert.equal(isSensitiveFilePath('/home/user/wildcard.pfx'), true);
+    assert.equal(isSensitiveFilePath('/data/cert.p12'), true);
+    assert.equal(isSensitiveFilePath('/Users/x/Passwords.kdbx'), true);
+    assert.equal(isSensitiveFilePath('/etc/ssl/private.key'), true);
+    assert.equal(isSensitiveFilePath('/home/user/key.asc'), true);
+    assert.equal(isSensitiveFilePath('/home/user/secret.gpg'), true);
+  });
+});
+
+describe('isSensitiveFilePath: system directories', () => {
+  it('blocks Linux/macOS system dirs', () => {
+    assert.equal(isSensitiveFilePath('/etc/shadow'), true);
+    assert.equal(isSensitiveFilePath('/etc/passwd'), true);
+    assert.equal(isSensitiveFilePath('/proc/self/environ'), true);
+    assert.equal(isSensitiveFilePath('/sys/class/net/eth0/address'), true);
+    assert.equal(isSensitiveFilePath('/root/.bash_history'), true);
+    assert.equal(isSensitiveFilePath('/var/log/auth.log'), true);
+    assert.equal(isSensitiveFilePath('/var/lib/sudo/lectured/user'), true);
+  });
+
+  it('blocks macOS keychains', () => {
+    assert.equal(isSensitiveFilePath('/Users/x/Library/Keychains/login.keychain-db'), true);
+  });
+
+  it('blocks Windows system dirs (forward and back slashes)', () => {
+    assert.equal(isSensitiveFilePath('C:\\Windows\\System32\\config\\SAM'), true);
+    assert.equal(isSensitiveFilePath('C:/Windows/System32/config/SAM'), true);
+    assert.equal(isSensitiveFilePath('D:/Windows/System32/notepad.exe'), true);
+  });
+
+  it('blocks Windows DPAPI / credential vault locations', () => {
+    assert.equal(isSensitiveFilePath('C:\\ProgramData\\Microsoft\\Crypto\\RSA\\MachineKeys\\x'), true);
+    assert.equal(isSensitiveFilePath('C:\\Users\\jordan\\AppData\\Local\\Microsoft\\Credentials\\x'), true);
+    assert.equal(isSensitiveFilePath('C:\\Users\\jordan\\AppData\\Roaming\\Microsoft\\Vault'), true);
+  });
+});
+
+describe('isSensitiveFilePath: browser and mail data', () => {
+  it('blocks browser credential stores', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.mozilla/firefox/abc.default/logins.json'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.mozilla/firefox/abc.default/key4.db'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.config/google-chrome/Default/Cookies'), true);
+    assert.equal(
+      isSensitiveFilePath('C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data'),
+      true
+    );
+  });
+
+  it('blocks real Linux Thunderbird profile layouts and root files', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/Mail/Local Folders'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/prefs.js'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/key4.db'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/logins.json'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/profiles.ini'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird'), true);
+  });
+
+  it('blocks Icedove and platform-specific Thunderbird profile roots', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.icedove/abc.default/prefs.js'), true);
+    assert.equal(isSensitiveFilePath('/Users/x/Library/Thunderbird/Profiles/abc/INBOX'), true);
+    assert.equal(isSensitiveFilePath('C:\\Users\\jordan\\AppData\\Roaming\\Thunderbird\\Profiles\\abc'), true);
+  });
+});
+
+describe('isSensitiveFilePath: benign paths pass through', () => {
+  it('allows typical user documents and downloads', () => {
+    assert.equal(isSensitiveFilePath('/home/user/Documents/report.pdf'), false);
+    assert.equal(isSensitiveFilePath('/home/user/Downloads/photo.jpg'), false);
+    assert.equal(isSensitiveFilePath('C:\\Users\\jordan\\Downloads\\invoice.xlsx'), false);
+    assert.equal(isSensitiveFilePath('/tmp/scratch.txt'), false);
+  });
+
+  it('allows files whose names merely contain substrings of patterns', () => {
+    // "ssh" inside a filename is not the /.ssh/ directory boundary
+    assert.equal(isSensitiveFilePath('/home/user/notes/ssh-cheatsheet.md'), false);
+    // .pemphigus is not .pem
+    assert.equal(isSensitiveFilePath('/home/user/medical/pemphigus.txt'), false);
+    // "etc" inside a path that doesn't start at /etc/
+    assert.equal(isSensitiveFilePath('/home/user/etc-notes.md'), false);
+    // All dot-directories are denied, including profile-like names.
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird-notes/report.txt'), true);
+  });
+
+  it('returns false on non-string / empty input rather than throwing', () => {
+    assert.equal(isSensitiveFilePath(''), false);
+    assert.equal(isSensitiveFilePath(null), false);
+    assert.equal(isSensitiveFilePath(undefined), false);
+    assert.equal(isSensitiveFilePath(123), false);
+    assert.equal(isSensitiveFilePath({}), false);
+  });
+});
+
+describe('isSensitiveFilePath: case insensitivity and slash normalization', () => {
+  it('matches regardless of letter case', () => {
+    assert.equal(isSensitiveFilePath('/HOME/USER/.SSH/ID_RSA'), true);
+    assert.equal(isSensitiveFilePath('/Etc/Shadow'), true);
+    assert.equal(isSensitiveFilePath('C:\\WINDOWS\\system32\\drivers'), true);
+  });
+
+  it('treats backslashes and forward slashes as equivalent boundaries', () => {
+    assert.equal(isSensitiveFilePath('C:/Users/x/.ssh/id_rsa'), true);
+    assert.equal(isSensitiveFilePath('C:\\Users\\x\\.ssh\\id_rsa'), true);
+  });
+});
+
+// Regression: the previous STRICT_BASE64_PATTERN used a group quantifier
+// ((?:[...]{4})*) that pushed a backtrack frame per base64 quartet. On
+// SpiderMonkey (Thunderbird's engine) this threw "InternalError: too much
+// recursion" for inputs beyond a few hundred KB, so every real-world inline
+// attachment failed validation. The validator must stay character-class-only
+// (linear, no per-iteration backtrack frames) while keeping the exact
+// canonical RFC 4648 semantics. The recursion itself is engine-specific and
+// not reproducible on V8, so these tests pin the semantics and exercise a
+// multi-megabyte input through the exact production code path.
+describe('isValidBase64: canonical RFC 4648 semantics and large inputs', () => {
+  const { isValidBase64 } = productionAttachmentValidation;
+
+  it('accepts canonical base64 with and without padding', () => {
+    assert.equal(isValidBase64('AAAA'), true);
+    assert.equal(isValidBase64('ABCD'), true);
+    assert.equal(isValidBase64('AB=='), true);
+    assert.equal(isValidBase64('ABC='), true);
+    assert.equal(isValidBase64('ABCDAB=='), true);
+    assert.equal(isValidBase64('+/+/'), true);
+  });
+
+  it('rejects non-canonical shapes', () => {
+    assert.equal(isValidBase64(''), false);
+    assert.equal(isValidBase64('A'), false);
+    assert.equal(isValidBase64('AB'), false);
+    assert.equal(isValidBase64('ABC'), false);
+    assert.equal(isValidBase64('A==='), false);
+    assert.equal(isValidBase64('===='), false);
+    assert.equal(isValidBase64('AB=C'), false);
+    assert.equal(isValidBase64('=ABC'), false);
+    assert.equal(isValidBase64('ABCD=BCD'), false);
+    assert.equal(isValidBase64('AAA!'), false);
+    assert.equal(isValidBase64('AA A'), false);
+    assert.equal(isValidBase64('AAAA\n'), false);
+  });
+
+  it('rejects non-string values', () => {
+    assert.equal(isValidBase64(null), false);
+    assert.equal(isValidBase64(undefined), false);
+    assert.equal(isValidBase64(123), false);
+    assert.equal(isValidBase64({}), false);
+  });
+
+  it('validates a multi-megabyte attachment payload', () => {
+    const bytes = Buffer.alloc(5 * 1024 * 1024, 0x42);
+    const encoded = bytes.toString('base64');
+    assert.equal(isValidBase64(encoded), true);
+    assert.equal(isValidBase64(encoded.slice(0, -1) + '!'), false);
+  });
+});
+
+// Windows device names in any component, with or without an extension.
+const WINDOWS_RESERVED_NAME_PATHS = [
+  'C:\\Docs\\CON', 'C:\\Docs\\nul.txt', 'C:\\Docs\\Aux.tar.gz', 'C:\\Docs\\prn', 'C:\\Docs\\COM0',
+  'C:\\Docs\\com9.log', 'C:\\Docs\\LPT1', 'C:\\Docs\\lpt0.txt', 'C:\\Docs\\COM\u00b9', 'C:\\Docs\\com\u00b2.txt',
+  'C:\\Docs\\LPT\u00b3', 'C:\\Docs\\CONIN$', 'C:\\Docs\\conout$.txt', 'C:\\Docs\\con .txt', 'C:/aux/report.pdf',
+];
+// Windows short (8.3) name components outside the trusted temp prefix.
+const WINDOWS_SHORT_NAME_PATHS = [
+  'C:\\PROGRA~1\\report.pdf', 'C:\\Users\\ALICE~1\\Documents\\report.pdf',
+  'C:/Users/alice/Documents/REPORT~1.PDF', 'C:/Users/alice/Documents/REPOR~12',
+  'C:\\Users\\APPDAT~1\\report.pdf', 'C:\\Users\\alice\\SSH~1\\id', 'C:\\Users\\alice\\THUNDE~1\\report.pdf',
+  'C:\\Temp\\CONNEC~1.JSO', 'C:\\Docs\\ABCDE~12.TXT',
+];
+const WINDOWS_SHORT_TEMP = 'C:\\Users\\ALICE~1\\AppData\\Local\\Temp';
+
+describe('Attachment policy parity', () => {
+  const bridge = require('./helpers/bridge.cjs');
+  it('keeps the duplicated pattern lists and helpers identical', () => {
+    const bridgeSource = fs.readFileSync(path.resolve(__dirname, '../mcp-bridge.cjs'), 'utf8');
+    const patternList = /const SENSITIVE_ATTACHMENT_PATTERNS = \[[\s\S]*?\n\];/;
+    assert.equal(apiSource.match(patternList)[0], bridgeSource.match(patternList)[0]);
+    const helpers = /function getAttachmentExportPathInfo[\s\S]*?function isSensitiveFilePath[\s\S]*?\n}/;
+    assert.equal(apiSource.match(helpers)[0], bridgeSource.match(helpers)[0]);
+  });
+
+  for (const file of [
+    'C:\\Keys\\backup.pem::$DATA', 'C:\\Keys\\file.pem:stream', 'C:/Keys/secret.pem.',
+    'C:/Keys/secret.pem ', 'C:/Keys. /report.pdf', 'C:/Keys /report.pdf',
+    '.env', '/home/user/project/.env.local', '/home/user/.codex/auth.json',
+    '/home/user/.claude/.credentials.json', '/home/user/.git-credentials',
+    '/home/user/.bash_history', '/home/user/.zsh_history', '/home/user/.local/share/keyrings/login.keyring',
+    '/home/user/.hidden/report.pdf', '/Users/user/Library/Application Support/tool/auth.json',
+    'C:\\Users\\user\\AppData\\Local\\tool\\auth.json', '/tmp/private_key.txt', '/tmp/private-key',
+    '/tmp/id_custom', '/tmp/server.pem', '/tmp/private.key', '/tmp/a.p12', '/tmp/a.pfx', '/tmp/a.kdbx',
+    '/tmp/login.keychain-db', '/tmp/key4.db', '/tmp/logins.json', '/tmp/Web Data', '/tmp/Local State',
+    '/tmp/Login Data', '/tmp/signons.sqlite', '/tmp/prefs.js',
+    '/documents/server.ppk', '/documents/client.ovpn', '/documents/release.jks', '/documents/release.keystore',
+    '/documents/AuthKey.p8', '/documents/passwords.kdb', '/documents/wallet.dat',
+    '/home/user/snap/chromium/common/chromium/Default/Local Storage/data',
+    '\\\\server\\share\\file.txt', '//server/share/file.txt', '\\\\?\\C:\\file.txt', '\\\\.\\C:\\file.txt', '//?/C:/file.txt', '//./C:/file.txt',
+    ...WINDOWS_RESERVED_NAME_PATHS, ...WINDOWS_SHORT_NAME_PATHS,
+  ]) {
+    it(`denies ${file} in both runtimes`, () => {
+      assert.equal(isSensitiveFilePath(file, { windows: true }), true);
+      assert.equal(bridge.isSensitiveFilePath(file, { windows: true }), true);
+    });
+  }
+  it('allows names that only resemble Windows device or short names in both runtimes', () => {
+    for (const file of ['C:\\Docs\\console.txt', 'C:\\Docs\\com10.txt', 'C:\\Docs\\auxiliary.pdf', 'C:\\Docs\\lpt.txt',
+      'C:\\Docs\\conin.txt', 'C:\\Docs\\notes~draft.txt', 'C:\\Docs\\~1.txt', 'C:\\Docs\\v1~2.final.pdf',
+      'C:\\Docs\\Invoice~2024.pdf', 'C:\\Docs\\scan~001.jpeg', 'C:\\Docs\\IMG~12345678.heic', 'C:\\Docs\\ABCDEF~12.TXT']) {
+      assert.equal(isSensitiveFilePath(file, { windows: true }), false, file);
+      assert.equal(bridge.isSensitiveFilePath(file, { windows: true }), false, file);
+    }
+    // These are ordinary file names outside Windows.
+    for (const file of ['/home/user/Documents/con', '/home/user/Documents/nul.txt', '/home/user/Documents/REPORT~1.PDF']) {
+      assert.equal(isSensitiveFilePath(file), false, file);
+      assert.equal(bridge.isSensitiveFilePath(file), false, file);
+    }
+  });
+
+  it('accepts a short-form temp directory prefix but no short names below it in both runtimes', () => {
+    const policy = { windows: true, exportRoots: [WINDOWS_SHORT_TEMP + '\\thunderbird-mcp'] };
+    const exported = WINDOWS_SHORT_TEMP + '\\thunderbird-mcp\\message_1\\report.pdf';
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check(exported, policy), false);
+      assert.equal(check(exported.toLowerCase().replace(/\\/g, '/'), policy), false);
+      for (const file of [
+        WINDOWS_SHORT_TEMP + '\\thunderbird-mcp\\message_1\\REPORT~1.PDF',
+        WINDOWS_SHORT_TEMP + '\\THUNDE~1\\message_1\\report.pdf',
+        'C:\\Users\\ALICE~1\\Documents\\report.pdf',
+        'C:\\Users\\ALICE~1\\AppData\\Local\\Temp2\\report.pdf',
+      ]) {
+        assert.equal(check(file, policy), true, file);
+      }
+    }
+  });
+
+  it('allows ordinary Documents paths in both runtimes', () => {
+    for (const file of ['/home/user/Documents/report.pdf', '/Users/user/Documents/report.pdf', 'C:\\Users\\user\\Documents\\report.pdf',
+      '/home/user/Documents/Library/book.pdf', '/Users/user/Documents/Library/book.pdf', 'D:\\Scans\\library\\scan.pdf']) {
+      assert.equal(isSensitiveFilePath(file), false);
+      assert.equal(bridge.isSensitiveFilePath(file), false);
+    }
+  });
+
+  for (const windows of [false, true]) {
+    it(`protects runtime profile roots at component boundaries in both runtimes (windows=${windows})`, () => {
+      const base = windows ? 'D:/Custom' : '/custom';
+      const policy = { windows, profileRoots: [base + '/active', base + '/profiles/'] };
+      for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+        for (const file of ['/active', '/active/abook.sqlite', '/active/Mail/Inbox', '/profiles/another/abook.sqlite']) {
+          assert.equal(check(base + file, policy), true, file);
+        }
+        assert.equal(check(base + '/active-backup/report.pdf', policy), false);
+        assert.equal(check(base + '/profiles-other/report.pdf', policy), false);
+        assert.equal(check(base + '/documents/report.pdf', policy), false);
+        assert.equal(check(base.toUpperCase() + '/ACTIVE/abook.sqlite', policy), windows);
+        if (windows) assert.equal(check('d:\\Custom\\active\\abook.sqlite', policy), true);
+      }
+    });
+  }
+
+  it('never exempts a runtime profile merely because it has an export layout', () => {
+    const exportRoot = '/custom/profile/thunderbird-mcp';
+    const policy = { exportRoots: [exportRoot], profileRoots: ['/custom/profile'] };
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check(exportRoot + '/message_1/report.pdf', policy), true);
+    }
+  });
+
+  it('protects case variants on macOS without changing Linux or POSIX path syntax', () => {
+    const profileRoots = ['/custom/Profile'];
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check('/custom/profile/abook.sqlite', { profileRoots, profileCaseInsensitive: true }), true);
+      assert.equal(check('/custom/profile/report.pdf', { profileRoots, profileCaseInsensitive: false }), false);
+      assert.equal(check('/custom/profile-notes/report.pdf', { profileRoots, profileCaseInsensitive: true }), false);
+      assert.equal(check('/documents/report:2026.pdf', { profileRoots, profileCaseInsensitive: true }), false);
+    }
+  });
+
+  for (const profileRoots of [undefined, null, 'bad', {}, [null], ['relative'], ['/valid', 7], ['/valid/../other'], ['/valid\0bad']]) {
+    it(`retains static policy with absent or malformed profile metadata: ${JSON.stringify(profileRoots)}`, () => {
+      for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+        assert.equal(check('/documents/report.pdf', { profileRoots }), false);
+        assert.equal(check('/documents/secret.ppk', { profileRoots }), true);
+      }
+    });
+  }
+
+  it('keeps valid roots on either side of an unsupported entry in both runtimes', () => {
+    for (const windows of [false, true]) {
+      const base = windows ? 'D:/Mail' : '/mail';
+      for (const rejected of [null, 7, {}, '', 'relative', base + '/bad\0root', base + '/./bad',
+        base + '/other/../bad', '\\\\server\\share', '//server/share']) {
+        const policy = { windows, profileRoots: [base + '/first', rejected, base + '/last'] };
+        for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+          assert.equal(check(base + '/first/abook.sqlite', policy), true);
+          assert.equal(check(base + '/last/Mail/Inbox', policy), true);
+          assert.equal(check(base + '/documents/report.pdf', policy), false);
+          assert.equal(check(base + '/credential.ppk', policy), true);
+          assert.equal(check('//server/share/file.txt', policy), true);
+        }
+      }
+    }
+  });
+
+  it('does not refuse ordinary files that resemble newly protected names', () => {
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      for (const file of ['/documents/release.jks.txt', '/documents/wallet.dat.pdf',
+        '/documents/keystore-notes.txt', '/home/user/snap/chromium/common/chromium-notes/report.pdf']) {
+        assert.equal(check(file), false, file);
+      }
+    }
+  });
+});
+
+// Uses the production conversion and mail entry points with in-memory XPCOM
+// substitutes. No Thunderbird profile, server, or native compose window is used.
+function makeOutboundMailRuntime(options = {}) {
+  const state = { writes: 0, decodes: 0, native: 0, params: 0, fields: 0, sent: 0, drafts: 0, windows: 0, fileCalls: 0, mimeReads: 0, dirCalls: 0, created: new Set(), removed: [], openStreams: 0 };
+  function tempFile(filePath) {
+    return {
+      ...makeMockLocalFile(filePath),
+      append(name) { this.path += '/' + name; },
+      create(type) { assert.equal(type, 1); },
+      normalize() { if (options.realTmpDir && this.path === options.tmpDir) this.path = options.realTmpDir; },
+      clone() { return tempFile(this.path); },
+      remove() {
+        assert.equal(state.openStreams, 0, 'streams must close before cleanup');
+        assert.ok(state.created.has(this.path), 'only this call\'s files may be removed');
+        state.created.delete(this.path);
+        state.removed.push(this.path);
+      },
+    };
+  }
+  const runtime = loadProductionAttachmentValidation({
+    console: { warn() {}, error() {} },
+    atob: data => { state.decodes++; return Buffer.from(data, 'base64').toString('binary'); },
+    createLocalFile(filePath) {
+      state.fileCalls++;
+      const normalizedPath = options.realTmpDir && filePath.startsWith(options.tmpDir + '/')
+        ? options.realTmpDir + filePath.slice(options.tmpDir.length) : filePath;
+      return options.files?.get(filePath) || makeMockLocalFile(filePath, { exists: !filePath.includes('missing'), normalizedPath });
+    },
+    MailServices: { headerParser: composeHeaderParser, accounts: { accounts: [{ key: 'account', identities: [{ key: 'sender' }, { key: 'id1' }] }] } },
+    Services: {
+      prefs: makeDirectSendPrefs(),
+      appinfo: { OS: options.os || 'Linux' },
+      dirsvc: { get(key) {
+        state.dirCalls++;
+        if (key === 'TmpD') return tempFile(options.tmpDir || '/temporary');
+        const directory = options.profileDirectories?.[key];
+        if (!directory) throw new Error('directory unavailable');
+        return directory.clone();
+      } },
+      io: { newFileURI: file => ({ spec: 'file://' + file.path }) },
+    },
+    Ci: {
+      nsIPrefBranch: prefTypes,
+      nsITimer: { TYPE_ONE_SHOT: 0 },
+      nsIMsgCompType: { New: 0, Reply: 1, ReplyAll: 2, ForwardInline: 3 },
+      nsIMsgCompDeliverMode: { Now: 0, SaveAsDraft: 1 },
+      nsIFile: { DIRECTORY_TYPE: 1 },
+    },
+    Cc: {
+      '@mozilla.org/timer;1': { createInstance: () => ({ initWithCallback() {}, cancel() {} }) },
+      '@mozilla.org/messengercompose/attachment;1': { createInstance: () => { state.native++; return new Proxy({}, {
+        set(target, prop, value) {
+          if (options.descriptorError && prop === 'name' && value === 'broken.pdf') throw new Error('invalid native attachment');
+          target[prop] = value;
+          return true;
+        },
+      }); } },
+      '@mozilla.org/messengercompose/composeparams;1': { createInstance: () => { state.params++; return {}; } },
+      '@mozilla.org/messengercompose/composefields;1': { createInstance: () => { state.fields++; return { addAttachment() {}, setHeader() {} }; } },
+      '@mozilla.org/messengercompose;1': { getService: () => ({ OpenComposeWindowWithParams() { state.windows++; } }) },
+      '@mozilla.org/network/file-output-stream;1': { createInstance: () => ({
+        init(file, flags) {
+          assert.ok(flags & 0x80, 'temporary file creation must be exclusive');
+          state.created.add(file.path);
+          state.openStreams++;
+        },
+        close() { state.openStreams--; },
+      }) },
+      '@mozilla.org/binaryoutputstream;1': { createInstance: () => ({
+        setOutputStream() {},
+        writeByteArray() { state.writes++; if (options.writeError) throw new Error('write failed'); },
+        close() {},
+      }) },
+    },
+    server: options.dispatch ? { registerPathHandler(_path, handler) { state.dispatch = handler; } } : undefined,
+    authToken: 'fixture-token',
+    timingSafeEqual: (a, b) => a === b,
+    MAX_REQUEST_BODY: 1024 * 1024,
+    readRequestBody: req => req.body,
+    isToolEnabled: () => true,
+    isSkipReviewBlocked: () => false,
+    setComposeIdentity(params) { params.identity = { key: 'sender' }; },
+    resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
+    buildBodyWithSignature: body => body || '',
+    findMessage: () => ({ msgHdr: {}, folder: { server: {}, getUriForMsg: () => 'message://fixture' } }),
+    getDirectQuoteContent: () => ({ body: 'Original text' }),
+    sendMessageDirectly(_fields, _identity, _descs, _uri, _type, mode) {
+      if (mode === 1) state.drafts++; else state.sent++;
+      return Promise.resolve({ success: true });
+    },
+    openComposeWindowWithCustomizations() { state.windows++; return Promise.resolve({ success: true }); },
+    ChromeUtils: { importESModule() {
+      return {
+        MsgHdrToMimeMessage(msgHdr, _listener, callback) {
+          state.mimeReads++;
+          callback(msgHdr, { contentType: 'text/plain', body: 'Original text' });
+        },
+      };
+    } },
+  }, options.transform);
+  // Both send paths must trip the existing no-send assertions.
+  runtime.sendThroughCompose = runtime.sendMessageDirectly;
+  runtime._tempAttachFiles.add('/prior-call.txt');
+  return { runtime, state };
+}
+
+// Reuse the existing HTTP fixture below for validation + dispatch tests.
+function dispatchHttpBody(state, body) {
+  return new Promise(resolve => {
+    let output = '';
+    state.dispatch({
+      method: 'POST', body,
+      getHeader: key => key === 'Authorization' ? 'Bearer fixture-token' : String(Buffer.byteLength(body)),
+    }, {
+      processAsync() {}, setStatusLine() {}, setHeader() {},
+      write(text) { output += text; },
+      finish() { resolve(JSON.parse(output)); },
+    });
+  });
+}
+
+describe('Outbound attachment failures are atomic', () => {
+  it('observes a successful compose send with the same counter used by no-send assertions', async () => {
+    const { runtime, state } = makeOutboundMailRuntime();
+    const result = await runtime.composeMail({ to: 'to@example.com', subject: 'subject', body: 'body', isHtml: false, attachments: [], skipReview: true });
+    assert.equal(result.success, true);
+    assert.equal(state.sent, 1);
+    assert.equal(state.drafts + state.windows + state.mimeReads, 0);
+  });
+
+  const calls = [
+    ['sendMail direct', (r, a) => r.composeMail({ to: 'to@example.com', subject: 'subject', body: 'body', isHtml: false, attachments: a, skipReview: true })],
+    ['sendMail review', (r, a) => r.composeMail({ to: 'to@example.com', subject: 'subject', body: 'body', isHtml: false, attachments: a, skipReview: false })],
+    ['saveDraft', (r, a) => r.saveDraft('to@example.com', 'subject', 'body', null, null, false, null, a)],
+    ['replyToMessage direct', (r, a) => r.replyToMessage('id', 'folder', 'body', false, false, null, null, null, null, a, true)],
+    ['replyToMessage review', (r, a) => r.replyToMessage('id', 'folder', 'body', false, false, null, null, null, null, a, false)],
+    ['forwardMessage direct', (r, a) => r.forwardMessage('id', 'folder', 'to@example.com', 'body', false, null, null, null, a, true)],
+    ['forwardMessage review', (r, a) => r.forwardMessage('id', 'folder', 'to@example.com', 'body', false, null, null, null, a, false)],
+  ];
+  for (const [name, invoke] of calls) {
+    for (const invalid of ['/home/user/.env', '/home/user/missing.pdf', { name: 'invalid.bin', base64: '%%%%' }, null]) {
+      it(`${name} refuses ${JSON.stringify(invalid)} with no side effects and removes its temp files`, async () => {
+        const { runtime, state } = makeOutboundMailRuntime();
+        const result = await invoke(runtime, [
+          '/home/user/Documents/report.pdf',
+          { name: 'inline.txt', base64: 'QQ==' },
+          invalid,
+        ]);
+        assert.match(result.error, /Attachments refused:/);
+        assert.ok(result.error.includes(invalid?.name || String(invalid)));
+        assert.equal(state.sent, 0);
+        assert.equal(state.drafts, 0);
+        assert.equal(state.windows, 0);
+        assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
+        assert.equal(state.created.size, 0);
+        assert.equal(state.removed.length, 0);
+        assert.equal(state.writes + state.decodes + state.native, 0);
+        assert.deepEqual(Array.from(runtime._tempAttachFiles), ['/prior-call.txt']);
+      });
+    }
+  }
+
+  for (const [name, invoke] of calls) {
+    it(`${name} refuses native descriptor conversion failures before side effects`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime({ descriptorError: true });
+      const result = await invoke(runtime, [
+        { name: 'inline.txt', base64: 'QQ==' }, '/home/user/Documents/broken.pdf',
+      ]);
+      assert.match(result.error, /broken.pdf.*invalid native attachment/);
+      assert.equal(state.sent + state.drafts + state.windows, 0);
+      assert.equal(state.mimeReads, /^(replyToMessage|forwardMessage) direct$/.test(name) ? 1 : 0);
+      assert.equal(state.created.size, 0);
+      assert.equal(state.removed.length, 1);
+    });
+  }
+
+  it('reuses prepared native attachments and reports unavailable compose insertion', () => {
+    const { runtime } = makeOutboundMailRuntime();
+    const { descs } = runtime.filePathsToAttachDescs(['/home/user/Documents/report.pdf']);
+    assert.strictEqual(runtime.descsToMsgAttachments(descs)[0], descs[0].msgAttachment);
+    assert.throws(() => runtime.addAttachmentsToComposeWindow({}, descs), /Cannot add attachments/);
+  });
+
+  it('cleans partially written inline files when the stream fails', () => {
+    const { runtime, state } = makeOutboundMailRuntime({ writeError: true });
+    assert.throws(() => runtime.filePathsToAttachDescs([{ name: 'inline.txt', base64: 'QQ==' }]), /write failed/);
+    assert.equal(state.created.size, 0);
+    assert.equal(state.openStreams, 0);
+    assert.equal(state.removed.length, 1);
+  });
+
+  it('checks network/device paths before creating or inspecting an nsIFile on every platform', () => {
+    for (const os of ['Linux', 'Darwin', 'WINNT']) {
+      const { runtime, state } = makeOutboundMailRuntime({ os });
+      for (const file of ['\\\\server\\share\\file.txt', '//server/share/file.txt', '\\\\?\\C:\\file.txt', '\\\\.\\C:\\file.txt', '//?/C:/file.txt', '//./C:/file.txt']) {
+        assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/);
+      }
+      assert.equal(state.fileCalls, 0);
+      assert.equal(state.created.size, 0);
+    }
+  });
+
+  for (const os of ['Linux', 'Darwin', 'WINNT']) {
+    it(`keeps a local profile protected alongside a UNC profiles root on ${os}`, () => {
+      const profile = os === 'WINNT' ? 'D:/Mail/active' : '/mail/active';
+      for (const uncRoot of ['\\\\server\\share\\profiles', '//server/share/profiles']) {
+        const { runtime, state } = makeOutboundMailRuntime({ os, profileDirectories: {
+          ProfD: makeMockLocalFile(profile), DefProfRt: makeMockLocalFile(uncRoot),
+        } });
+        assert.throws(() => runtime.filePathsToAttachDescs([profile + '/abook.sqlite']), /sensitive path blocked/);
+        assert.throws(() => runtime.filePathsToAttachDescs([uncRoot + '/other/abook.sqlite']), /sensitive path blocked/);
+        assert.equal(state.fileCalls, 0);
+        assert.equal(state.sent + state.drafts + state.windows, 0);
+        assert.equal(runtime.filePathsToAttachDescs([profile + '-documents/report.pdf']).descs.length, 1);
+      }
+    });
+
+    it(`preserves valid profile entries around malformed ones during conversion on ${os}`, () => {
+      const base = os === 'WINNT' ? 'D:/Mail' : '/mail';
+      for (const rejected of [null, 7, {}, '', 'relative/profile', base + '/bad\0root',
+        base + '/other/../profile', base + '/./profile']) {
+        const { runtime, state } = makeOutboundMailRuntime({ os });
+        runtime.getThunderbirdProfileRoots = () => [base + '/first', rejected, base + '/last'];
+        for (const file of [base + '/first/abook.sqlite', base + '/last/Mail/Inbox', base + '/credential.ppk']) {
+          assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/,
+            `${file}, rejected=${JSON.stringify(rejected)}`);
+        }
+        assert.equal(state.fileCalls, 0);
+        assert.equal(runtime.filePathsToAttachDescs([base + '/documents/report.pdf']).descs.length, 1);
+      }
+    });
+
+    it(`refuses lexical and canonical runtime profiles through outbound conversion on ${os}`, () => {
+      const base = os === 'WINNT' ? 'D:/Custom' : '/custom';
+      const profile = base + '/profile';
+      const profiles = base + '/profiles';
+      const canonical = base + '/canonical';
+      const canonicalProfiles = base + '/canonical-profiles';
+      const profileDirectories = {
+        ProfD: makeMockLocalFile(profile, { normalizedPath: os === 'WINNT' ? profile : canonical, target: canonical }),
+        DefProfRt: makeMockLocalFile(profiles, { normalizedPath: os === 'WINNT' ? profiles : canonicalProfiles, target: canonicalProfiles }),
+      };
+      const { runtime, state } = makeOutboundMailRuntime({ os, profileDirectories });
+      for (const root of [profile, profiles, canonical, canonicalProfiles]) {
+        assert.throws(() => runtime.filePathsToAttachDescs([root + '/abook.sqlite']), /sensitive path blocked/);
+        if (os !== 'Linux') {
+          assert.throws(() => runtime.filePathsToAttachDescs([root.toUpperCase() + '/abook.sqlite']), /sensitive path blocked/);
+        }
+      }
+      assert.equal(state.fileCalls, 0);
+      assert.equal(state.sent + state.drafts + state.windows, 0);
+      assert.equal(runtime.filePathsToAttachDescs([profile + '-documents/report.pdf']).descs.length, 1);
+      const exported = runtime.ensureAttachmentDir('message_1');
+      exported.append('report.pdf');
+      assert.equal(runtime.filePathsToAttachDescs([exported.path]).descs.length, 1);
+    });
+  }
+
+  it('refuses a path that normalizes into a runtime profile', () => {
+    const profile = '/custom/profile';
+    const alias = '/documents/report.pdf';
+    const { runtime } = makeOutboundMailRuntime({
+      profileDirectories: { ProfD: makeMockLocalFile(profile) },
+      files: new Map([[alias, makeMockLocalFile(alias, { normalizedPath: profile + '/abook.sqlite' })]]),
+    });
+    assert.throws(() => runtime.filePathsToAttachDescs([alias]), /sensitive path blocked/);
+  });
+
+  it('rejects Windows streams and trailing dots/spaces before touching nsIFile or TmpD', () => {
+    for (const os of ['WINNT']) {
+      const { runtime, state } = makeOutboundMailRuntime({ os });
+      for (const file of [
+        'C:\\Keys\\backup.pem::$DATA', 'C:\\Keys\\file.pem:stream',
+        'C:/Keys/secret.pem.', 'C:/Keys/secret.pem ', 'C:/Keys. /report.pdf',
+        ...(os === 'WINNT' ? ['file.pem:stream', '/Keys/secret.pem.'] : []),
+      ]) {
+        assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/);
+      }
+      assert.equal(state.fileCalls, 0);
+      assert.equal(state.dirCalls, 0);
+    }
+  });
+
+  for (const [os, tmpDir] of [
+    ['WINNT', 'C:/Users/user/AppData/Local/Temp'],
+    ['Linux', '/home/user/.var/app/net.thunderbird.Thunderbird/cache/tmp'],
+  ]) {
+    it(`reattaches getMessage exports from ${tmpDir} and keeps the exemption narrow`, () => {
+      const { runtime } = makeOutboundMailRuntime({ os, tmpDir });
+      const exported = runtime.ensureAttachmentDir('message_1');
+      exported.append('report.pdf');
+      const { descs } = runtime.filePathsToAttachDescs([exported.path]);
+      assert.equal(descs.length, 1);
+      assert.equal(descs[0].url, 'file://' + exported.path);
+      const base = tmpDir + '/thunderbird-mcp';
+      for (const file of [
+        base + '/connection.json', base + '/other.txt', base + '/attachments/report.pdf',
+        base + '/message_1/secret.pem', base + '/message_1/.env', base + '/message_1/key4.db',
+        base + '/message_1/connection.json', base + '/message_1/../connection.json',
+        base + '/message_1/../message_1/report.pdf', base + '/message_1/../../report.pdf',
+        tmpDir + '/other-app/thunderbird-mcp/message_1/report.pdf',
+      ]) {
+        assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/, file);
+      }
+    });
+
+    it(`rejects normalized symlink redirects both into and out of ${os} exports`, () => {
+      const exported = tmpDir + '/thunderbird-mcp/message_1/report.pdf';
+      const outside = os === 'WINNT' ? 'C:/Users/user/Documents/report.pdf' : '/home/user/Documents/report.pdf';
+      for (const [original, target] of [[exported, outside], [outside, exported]]) {
+        const { runtime } = makeOutboundMailRuntime({ os, tmpDir, files: new Map([
+          [original, makeMockLocalFile(original, { normalizedPath: target })],
+        ]) });
+        assert.throws(() => runtime.filePathsToAttachDescs([original]), /export path is redirected/);
+      }
+    });
+  }
+
+  for (const os of ['Linux', 'Darwin']) {
+    it(`allows legal POSIX attachment names on ${os}`, () => {
+      const { runtime } = makeOutboundMailRuntime({ os });
+      for (const name of ['a:b:c.txt', 'report.txt.', 'report.txt ', 'file.pem:stream']) {
+        const file = '/home/user/Documents/' + name;
+        assert.equal(runtime.filePathsToAttachDescs([file]).descs[0].url, 'file://' + file);
+      }
+    });
+
+    it(`rejects crafted backslash filenames outside the ${os} export subtree`, () => {
+      const tmpDir = '/home/user/.var/app/net.thunderbird.Thunderbird/cache/tmp';
+      const { runtime, state } = makeOutboundMailRuntime({ os, tmpDir });
+      for (const suffix of ['thunderbird-mcp\\message_1\\auth.json', 'thunderbird-mcp\\message_1/auth.json']) {
+        assert.throws(() => runtime.filePathsToAttachDescs([tmpDir + '/' + suffix]), /sensitive path blocked/);
+      }
+      assert.equal(state.fileCalls, 0);
+    });
+
+    it(`allows a canonical ${os} TmpD alias but refuses redirects below it`, () => {
+      const tmpDir = '/var/folders/.temporary';
+      const realTmpDir = '/private/var/folders/.temporary';
+      const { runtime } = makeOutboundMailRuntime({ os, tmpDir, realTmpDir });
+      const exported = runtime.ensureAttachmentDir('message_1');
+      exported.append('report.pdf');
+      const expected = realTmpDir + '/thunderbird-mcp/message_1/report.pdf';
+      assert.equal(runtime.filePathsToAttachDescs([exported.path]).descs[0].url, 'file://' + expected);
+      assert.equal(runtime.filePathsToAttachDescs([expected]).descs[0].url, 'file://' + expected);
+      for (const target of [
+        realTmpDir + '/thunderbird-mcp/message_2/report.pdf',
+        realTmpDir + '/elsewhere/message_1/report.pdf',
+      ]) {
+        const redirected = makeOutboundMailRuntime({ os, tmpDir, realTmpDir, files: new Map([
+          [exported.path, makeMockLocalFile(exported.path, { normalizedPath: target })],
+        ]) });
+        assert.throws(() => redirected.runtime.filePathsToAttachDescs([exported.path]), /export path is redirected|sensitive path blocked/);
+      }
+    });
+  }
+
+  for (const name of ['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']) {
+    for (const skipReview of name === 'saveDraft' ? [undefined] : [false, true]) {
+      it(`HTTP dispatch coerces ${name} attachment strings and refuses the whole operation (skipReview=${skipReview})`, async () => {
+        const { state } = makeOutboundMailRuntime({ dispatch: true });
+        const body = JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {
+            ...productionToolArgs[name], skipReview,
+            attachments: JSON.stringify([
+              '/home/user/Documents/report.pdf', { name: 'inline.txt', base64: 'QQ==' }, '/home/user/.env',
+            ]),
+          } },
+        });
+        const response = await dispatchHttpBody(state, body);
+        assert.equal(response.error, undefined);
+        const result = JSON.parse(response.result.content[0].text);
+        assert.match(result.error, /Attachments refused:.*\/home\/user\/\.env/);
+        // The parsed array reaches path inspection, but refusal precedes all writes.
+        assert.equal(state.fileCalls, 1);
+        assert.equal(state.removed.length, 0);
+        assert.equal(state.writes + state.decodes + state.native, 0);
+        assert.equal(state.created.size, 0);
+        assert.equal(state.sent + state.drafts + state.windows, 0);
+        assert.equal(state.mimeReads, skipReview && ['replyToMessage', 'forwardMessage'].includes(name) ? 1 : 0);
+      });
+    }
+  }
+
+  it('refuses Windows device and short-name components before touching nsIFile', () => {
+    const { runtime, state } = makeOutboundMailRuntime({ os: 'WINNT' });
+    for (const file of [...WINDOWS_RESERVED_NAME_PATHS, ...WINDOWS_SHORT_NAME_PATHS]) {
+      assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/, file);
+    }
+    assert.equal(state.fileCalls, 0);
+  });
+
+  it('accepts Windows exports below a short-form TmpD', () => {
+    const tmpDir = WINDOWS_SHORT_TEMP.replace(/\\/g, '/');
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', tmpDir });
+    assert.equal(runtime.filePathsToAttachDescs([tmpDir + '/thunderbird-mcp/message_1/report.pdf']).descs.length, 1);
+    assert.throws(() => runtime.filePathsToAttachDescs([tmpDir + '/thunderbird-mcp/message_1/REPORT~1.PDF']), /sensitive path blocked/);
+  });
+
+  it('allows Windows exports through ordinary AppData ancestors but refuses redirected ones', () => {
+    const tmpDir = 'C:/Users/user/AppData/Local/Temp';
+    const file = tmpDir + '/thunderbird-mcp/message_1/report.pdf';
+    for (const redirected of [false, true]) {
+      const appData = makeMockLocalFile('C:/Users/user/AppData', redirected ? { target: 'C:/Elsewhere' } : {});
+      const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', tmpDir, files: new Map([
+        [file, makeMockLocalFile(file, { parent: appData })],
+      ]) });
+      if (redirected) assert.throws(() => runtime.filePathsToAttachDescs([file]), /junction path blocked/);
+      else assert.equal(runtime.filePathsToAttachDescs([file]).descs.length, 1);
+    }
+  });
+
+  it('checks the normalized nsIFile path against the policy', () => {
+    const original = '/home/user/Documents/report.pdf';
+    const { runtime } = makeOutboundMailRuntime({ files: new Map([[original,
+      makeMockLocalFile(original, { normalizedPath: '/home/user/.credentials/report.pdf' }),
+    ]]) });
+    assert.throws(() => runtime.filePathsToAttachDescs([original]), /sensitive path blocked/);
+  });
+
+  it('forces Windows ancestor resolution before reading target and refuses junctions', () => {
+    const original = 'C:\\Users\\user\\Documents\\report.pdf';
+    const parent = makeMockLocalFile('C:\\Users\\user\\Documents', { target: 'C:\\Users\\user\\AppData' });
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', files: new Map([[original,
+      makeMockLocalFile(original, { parent }),
+    ]]) });
+    assert.throws(() => runtime.filePathsToAttachDescs([original]), /junction path blocked/);
+  });
+
+  it('walks Windows parents through the drive root without normalizing it again', () => {
+    const drive = makeMockLocalFile('C:', { normalizeError: new Error('drive-relative normalization') });
+    const users = makeMockLocalFile('C:/Users', { parent: drive });
+    const user = makeMockLocalFile('C:/Users/user', { parent: users });
+    const documents = makeMockLocalFile('C:/Users/user/Documents', { parent: user });
+    const original = 'C:/Users/user/Documents/report.pdf';
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', files: new Map([[original,
+      makeMockLocalFile(original, { parent: documents }),
+    ]]) });
+    assert.equal(runtime.filePathsToAttachDescs([original]).descs.length, 1);
+    assert.equal(drive.resolved, true);
+  });
+
+  it('fails closed on Windows resolution failure and accepts ordinary Documents files', () => {
+    const original = 'C:\\Users\\user\\Documents\\report.pdf';
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', files: new Map([[original,
+      makeMockLocalFile(original, { readError: new Error('resolution failed') }),
+    ]]) });
+    assert.throws(() => runtime.filePathsToAttachDescs([original]), /resolution failed/);
+    for (const os of ['Linux', 'Darwin', 'WINNT']) {
+      const { runtime: allowed } = makeOutboundMailRuntime({ os });
+      const result = allowed.filePathsToAttachDescs([os === 'WINNT' ? original : '/home/user/Documents/report.pdf']);
+      assert.equal(result.descs.length, 1);
+    }
+  });
+});
+
+describe('recipient summary production schemas', () => {
+  const runtime = loadProductionAttachmentValidation();
+  vm.runInContext(getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'), runtime);
+
+  for (const name of ['searchMessages', 'getRecentMessages']) {
+    it(`${name} accepts the optional boolean and null without changing the default`, () => {
+      const tool = runtime.buildTools().find(item => item.name === name);
+      assert.equal(tool.inputSchema.properties.fullRecipients.type, 'boolean');
+      assert.ok(!tool.inputSchema.required.includes('fullRecipients'));
+      for (const fullRecipients of [undefined, null, false, true]) {
+        const args = { query: '', fullRecipients };
+        if (name === 'getRecentMessages') delete args.query;
+        assert.equal(runtime.validateToolArgs(name, args).length, 0);
+        assert.equal(runtime.coerceToolArgs(name, args).fullRecipients, fullRecipients);
+      }
+    });
+
+    it(`${name} applies the existing boolean coercion and rejects other types`, () => {
+      for (const text of ['true', 'false']) {
+        const args = runtime.coerceToolArgs(name, { fullRecipients: text });
+        assert.equal(args.fullRecipients, text === 'true');
+      }
+      for (const fullRecipients of [1, {}, [], 'yes']) {
+        const args = { query: '', fullRecipients };
+        if (name === 'getRecentMessages') delete args.query;
+        assert.ok(runtime.validateToolArgs(name, args).some(error => error.includes('fullRecipients')));
+      }
+    });
+  }
+
+  it('keeps full message and header reader schemas separate from row summaries', () => {
+    for (const name of ['getMessage', 'getMessages', 'getMessageHeaders', 'batchGetMessageHeaders']) {
+      const tool = runtime.buildTools().find(item => item.name === name);
+      assert.equal(Object.hasOwn(tool.inputSchema.properties, 'fullRecipients'), false);
+    }
+  });
+});
+
+describe('saveDraft dedicated scheduling schema', () => {
+  const runtime = loadProductionAttachmentValidation();
+  vm.runInContext(getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'), runtime);
+
+  it('accepts optional scheduling and null through the production validator', () => {
+    for (const sendAt of [undefined, null, '2027-01-01T12:00:00Z']) {
+      assert.equal(runtime.validateToolArgs('saveDraft', { sendAt }).length, 0);
+    }
+  });
+
+  it('rejects raw header writing, caller UUIDs, and a saveDraft skipReview shortcut', () => {
+    for (const [name, value] of [['headers', { 'X-Send-Later-At': 'tomorrow' }], ['uuid', 'caller-instance'], ['skipReview', true]]) {
+      assert.match(runtime.validateToolArgs('saveDraft', { [name]: value })[0], /Unknown parameter/);
+    }
+  });
+
+  it('rejects wrong-type scheduling arguments', () => {
+    for (const sendAt of [42, true, {}, []]) {
+      assert.ok(runtime.validateToolArgs('saveDraft', { sendAt }).length > 0);
+    }
+  });
+});
+
+describe('Validation: getMessageHeaders', () => {
+  it('accepts messageId + folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects missing messageId', () => {
+    const errors = validate('getMessageHeaders', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: messageId/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  it('rejects messageId of the wrong type', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: 42,
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+      headers: ['Subject'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: headers/);
+  });
+});
+
+describe(`Validation: ${HEADER_BATCH_TOOL}`, () => {
+  const folderPath = 'imap://user@server/INBOX';
+  const boundsError = `Parameter 'messageIds' must contain at most ${MAX_HEADER_BATCH_IDS} item(s)`;
+
+  it('accepts a valid batch', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: Array.from({ length: 10 }, (_, index) => `<message-${index}@example.com>`),
+      folderPath,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // No schema minItems: an empty array is valid at the dispatch layer; the
+  // handler short-circuits it to { headers: {}, total: 0, failed: 0 }.
+  it('accepts an empty messageIds array (handler returns the empty fast path)', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: [],
+      folderPath,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it(`accepts exactly ${MAX_HEADER_BATCH_IDS} ids and rejects ${MAX_HEADER_BATCH_IDS + 1} with a single bounds error`, () => {
+    const ids = count => Array.from({ length: count }, (_, index) => `<message-${index}@example.com>`);
+    assert.deepStrictEqual(validate(HEADER_BATCH_TOOL, {
+      messageIds: ids(MAX_HEADER_BATCH_IDS),
+      folderPath,
+    }), []);
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: ids(MAX_HEADER_BATCH_IDS + 1),
+      folderPath,
+    });
+    assert.deepStrictEqual(errors, [boundsError]);
+  });
+
+  it('rejects an over-cap malformed batch with only the bounds error', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: Array(MAX_HEADER_BATCH_IDS + 1).fill(null),
+      folderPath,
+    });
+    assert.deepStrictEqual(errors, [boundsError]);
+  });
+
+  it('rejects messageIds passed as a non-array', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: '<abc@example.com>',
+      folderPath,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: ['<abc@example.com>'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  // The recursive validator walks the items, so a null element is rejected
+  // before the handler runs.
+  it('rejects a null array item', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: ['<abc@example.com>', null],
+      folderPath,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /messageIds\[1\]/);
+  });
+
+  it('rejects an empty-string id', () => {
+    const errors = validate(HEADER_BATCH_TOOL, {
+      messageIds: [''],
+      folderPath,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1 character/);
+  });
+});
+
+describe('Validation: dryRunCompose schema', () => {
+  it('accepts minimal required fields (to, subject, body)', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello there',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts all optional scalar fields', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      cc: 'bob@example.com',
+      bcc: 'carol@example.com',
+      isHtml: true,
+      from: 'me@example.com',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects when required field is missing', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: body/);
+  });
+
+  it('rejects isHtml as string', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      isHtml: 'true',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be boolean/);
+  });
+
+  it('accepts skipReview and includeSignature like sendMail', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      skipReview: true,
+      includeSignature: false,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects unknown top-level parameter', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      bogus: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: bogus/);
+  });
+
+  it('accepts attachments as array of file-path strings', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: ['/home/user/report.pdf', '/tmp/data.csv'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts inline attachment with required name + base64', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt', base64: 'aGVsbG8=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // Same inline-attachment schema as sendMail: an entry with neither base64
+  // nor content is rejected by the validator.
+  it('rejects inline {name} with neither base64 nor content', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt' }],
+    });
+    assert.ok(errors.length > 0);
+  });
+
+  it('accepts inline attachment using the content alias for base64', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt', content: 'aGVsbG8=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects attachments as a non-array', () => {
+    const errors = validateProductionToolArgs('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: '/home/user/report.pdf',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+});
+
+
+describe('dryRunCompose behavior', () => {
+  function makeRuntime(options = {}) {
+    const { runtime, state } = makeOutboundMailRuntime(options);
+    runtime.isSkipReviewBlocked = () => options.skipReviewBlocked !== false;
+    runtime.setComposeIdentity = (params, from) => {
+      if (from === 'nobody@example.com') return { error: 'unknown identity: nobody@example.com -- no matching account configured in Thunderbird' };
+      params.identity = { key: 'id1', email: 'me@example.com', fullName: 'Me' };
+      return '';
+    };
+    runtime.resolveComposeFormat = (_identity, isHtml) => ({ useHtml: isHtml === true, format: 0 });
+    runtime.MailServices.headerParser = {
+      ...composeHeaderParser,
+      parseDecodedHeader(header, groups) {
+        assert.equal(groups, false);
+        return (header.match(/(?:[^,"]|"[^"]*")+/g) || []).map(email => ({ email }));
+      },
+    };
+    return { runtime, state };
+  }
+  const noSideEffects = state => {
+    assert.equal(state.sent, 0);
+    assert.equal(state.drafts, 0);
+    assert.equal(state.windows, 0);
+    assert.equal(state.mimeReads, 0);
+    assert.equal(state.created.size, 0);
+    assert.equal(state.removed.length, 0);
+    assert.equal(state.writes + state.decodes + state.native + state.params + state.fields, 0);
+  };
+
+  it('reports a clean call without writing, sending or opening anything', () => {
+    const { runtime, state } = makeRuntime();
+    const result = runtime.dryRunCompose({ to: 'a@example.com, b@example.com', subject: 'subj', body: 'body text', cc: 'c@example.com', isHtml: true, attachments: [
+      '/home/user/Documents/report.pdf',
+      { name: 'inline.txt', content: 'QUJDREVG' },
+    ] });
+    assert.equal(result.wouldSucceed, true);
+    assert.deepEqual(Array.from(result.blockers), []);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.recipients)), { to: 2, cc: 1, bcc: 0 });
+    assert.equal(result.inputBodyLength, 9);
+    assert.equal(result.isHtml, true);
+    assert.equal(result.mode, 'review-window');
+    assert.equal(result.resolvedIdentity.email, 'me@example.com');
+    assert.equal(result.attachments.length, 2);
+    assert.equal(result.attachments[1].size, 6);
+    noSideEffects(state);
+    assert.deepEqual(Array.from(runtime._tempAttachFiles), ['/prior-call.txt']);
+  });
+
+  it('inline attachments are not decoded or written', () => {
+    const { runtime, state } = makeRuntime();
+    const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [{ name: 'x.bin', base64: 'QQ==' }] });
+    assert.equal(result.wouldSucceed, true);
+    assert.equal(result.attachments[0].size, 1);
+    noSideEffects(state);
+  });
+
+  it('reports the same attachment refusals as the real path', () => {
+    for (const invalid of ['/home/user/.env', '/home/user/missing.pdf', { name: 'invalid.bin', base64: '%%%%' }]) {
+      const { runtime, state } = makeRuntime();
+      const dry = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [invalid] });
+      const real = runtime.composeMail({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [invalid], skipReview: false });
+      assert.equal(dry.wouldSucceed, false);
+      assert.equal(dry.blockers[0], real.error.replace(/^Error: /, ''));
+      assert.equal(state.windows, 0);
+    }
+  });
+
+  it('reports a blocked skipReview exactly like the real path, and honors it when allowed', () => {
+    const { runtime } = makeRuntime();
+    const blocked = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true });
+    assert.equal(blocked.wouldSucceed, false);
+    assert.equal(blocked.mode, 'direct-send');
+    assert.equal(blocked.blockers[0], runtime.composeMail({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true }).error);
+    const { runtime: open } = makeRuntime({ skipReviewBlocked: false });
+    assert.equal(open.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true }).wouldSucceed, true);
+  });
+
+  it('surfaces an unresolvable from identity', () => {
+    const { runtime } = makeRuntime();
+    const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, from: 'nobody@example.com' });
+    assert.equal(result.wouldSucceed, false);
+    assert.match(result.blockers[0], /unknown identity/);
+    assert.equal(result.resolvedIdentity, null);
+    assert.equal(result.estimatedEncodedBytes, null);
+    assert.equal(result.warningThresholdBytes, null);
+  });
+
+  it('is refused through shared dependency access when sendMail is disabled and probes no paths', async () => {
+    const { loadPrivacyRuntime } = require('./helpers/privacy-access.cjs');
+    const access = loadPrivacyRuntime({ initial: { PREF_DISABLED_TOOLS: '["sendMail"]' } });
+    const { runtime, state } = makeRuntime({ dispatch: true });
+    runtime.isToolEnabled = access.isToolEnabled;
+    const response = await dispatchHttpBody(state, JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'dryRunCompose', arguments: {
+        to: 'a@example.com', subject: 's', body: 'b', attachments: ['/home/user/Documents/report.pdf'],
+      } },
+    }));
+    assert.match(response.error.message, /Tool is disabled/);
+    assert.equal(state.fileCalls, 0);
+    noSideEffects(state);
+  });
+
+  it('fails a direct send with no recipients, but not a review window', () => {
+    const { runtime } = makeRuntime({ skipReviewBlocked: false });
+    const direct = runtime.dryRunCompose({ to: '', subject: 's', body: 'b', cc: '', isHtml: false, skipReview: true });
+    assert.equal(direct.wouldSucceed, false);
+    assert.match(direct.blockers[0], /at least one recipient/);
+    assert.equal(runtime.dryRunCompose({ to: '', subject: 's', body: 'b', bcc: 'x@example.com', isHtml: false, skipReview: true }).wouldSucceed, true);
+    assert.equal(runtime.dryRunCompose({ to: '', subject: 's', body: 'b', isHtml: false, skipReview: false }).wouldSucceed, true);
+  });
+
+  it('counts parsed recipients without echoing caller-only fields', () => {
+    const { runtime } = makeRuntime({ skipReviewBlocked: false });
+    const review = runtime.dryRunCompose({ to: '"Doe, Jane" <j@example.com>, k@example.com', subject: 's', body: 'b', isHtml: false });
+    assert.equal(review.recipients.to, 2);
+    assert.equal(review.includeSignature, undefined);
+    assert.equal(review.subject, undefined);
+    const direct = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, skipReview: true, includeSignature: false });
+    assert.equal(direct.includeSignature, undefined);
+  });
+
+  it('derives inline sizes that match the real decoded size, including padding', () => {
+    for (const raw of ['A', 'AB', 'ABC', 'ABCD', 'ABCDE']) {
+      const b64 = Buffer.from(raw).toString('base64');
+      const { runtime } = makeRuntime();
+      const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: [{ name: 'x.bin', base64: b64 }] });
+      assert.equal(result.attachments[0].size, Buffer.from(b64, 'base64').length, b64);
+    }
+  });
+
+  it('applies the aggregate attachment limit to inline entries like the real path', () => {
+    const { runtime } = makeRuntime();
+    const chunk = 'A'.repeat(20 * 1024 * 1024); // 15 MiB decoded each
+    const entries = [1, 2, 3, 4].map(i => ({ name: `part${i}.bin`, base64: chunk }));
+    const dry = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: entries });
+    const real = runtime.composeMail({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: entries, skipReview: false });
+    assert.equal(dry.wouldSucceed, false);
+    assert.match(dry.blockers[0], /aggregate attachment limit/);
+    assert.equal(dry.blockers[0], real.error.replace(/^Error: /, ''));
+  });
+
+  it('enforces the attachment count limit', () => {
+    const { runtime } = makeRuntime();
+    const many = Array.from({ length: runtime.attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE + 1 }, () => '/home/user/Documents/report.pdf');
+    const result = runtime.dryRunCompose({ to: 'a@example.com', subject: 's', body: 'b', isHtml: false, attachments: many });
+    assert.equal(result.wouldSucceed, false);
+    assert.match(result.blockers[0], /attachment limit/);
+  });
+});
+
+
+describe('Shared compose preparation through production dispatch', () => {
+  const { loadToolSchema } = require('./helpers/tool-schema.cjs');
+  const args = { to: 'to@example.com', subject: 'subject', body: 'body', skipReview: true };
+  const extraSchema = {
+    type: 'object', description: 'fixture argument',
+    properties: { description: { type: 'string', minLength: 2, description: 'field named description' },
+      count: { type: 'integer', minimum: 1, maximum: 4, default: 2 } },
+    required: ['description'], additionalProperties: false,
+    default: { description: 'preserve default data' },
+  };
+  const extendSchema = code => code.replace(
+    '      definitions.find(tool => tool.name === "dryRunCompose").inputSchema =',
+    `      definitions.find(tool => tool.name === "sendMail").inputSchema.properties.futureArgument = ${JSON.stringify(extraSchema)};
+      definitions.find(tool => tool.name === "dryRunCompose").inputSchema =`
+  );
+
+  it('derives all constraints and defaults recursively, preserving properties named description', () => {
+    const runtime = loadToolSchema(extendSchema);
+    const tools = runtime.buildTools();
+    const real = tools.find(tool => tool.name === 'sendMail').inputSchema;
+    const dry = tools.find(tool => tool.name === 'dryRunCompose').inputSchema;
+    // Independent expected projection: explicit mutation of descriptions known
+    // to this fixture, plus JSON replacer for the existing sendMail schema.
+    const existing = loadToolSchema().buildTools().find(tool => tool.name === 'sendMail').inputSchema;
+    const expected = JSON.parse(JSON.stringify(existing, (key, value) => key === 'description' ? undefined : value));
+    const fixture = structuredClone(extraSchema);
+    delete fixture.description;
+    delete fixture.properties.description.description;
+    expected.properties.futureArgument = fixture;
+    assert.deepEqual(JSON.parse(JSON.stringify(dry)), expected);
+    assert.equal(real.properties.futureArgument.description, 'fixture argument');
+    assert.equal(dry.properties.futureArgument.default.description, 'preserve default data');
+    assert.equal(dry.properties.dryRun, undefined);
+    assert.equal(dry.properties.sendAt, undefined);
+  });
+
+  it('validates a fixture-added argument and passes the complete object to shared validation through BOTH HTTP paths', async () => {
+    const { runtime, state } = makeOutboundMailRuntime({ dispatch: true, transform: extendSchema });
+    const seen = [];
+    const prepare = runtime.prepareCompose;
+    runtime.prepareCompose = value => {
+      seen.push(value.futureArgument);
+      const plan = prepare(value);
+      assert.equal(plan.error, undefined);
+      return { error: `fixture validation: ${value.futureArgument.description}` };
+    };
+    for (const name of ['sendMail', 'dryRunCompose']) {
+      const invoke = futureArgument => dispatchHttpBody(state, JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: { ...args, futureArgument } },
+      }));
+      const invalid = await invoke({ description: 'x' });
+      assert.match(invalid.error.message, /futureArgument.description/);
+      const response = await invoke({ description: 'checked', count: 2 });
+      const result = JSON.parse(response.result.content[0].text);
+      assert.equal(name === 'sendMail' ? result.error : result.blockers[0], 'fixture validation: checked');
+    }
+    assert.deepEqual(JSON.parse(JSON.stringify(seen)), Array(2).fill({ description: 'checked', count: 2 }));
+    assert.equal(state.writes + state.native + state.params + state.fields + state.sent + state.windows, 0);
+  });
+
+  it('uses the same FIRST refusal for skipReview, identity encryption, ownership and attachments', async () => {
+    for (const failure of ['block', 'identity', 'encryption', 'account', 'attachment']) {
+      const { runtime, state } = makeOutboundMailRuntime({ dispatch: true });
+      runtime.isSkipReviewBlocked = () => failure === 'block';
+      if (failure === 'identity') runtime.setComposeIdentity = () => ({ error: 'unknown identity' });
+      if (failure === 'encryption') runtime.Services.prefs = makeDirectSendPrefs({ 'mail.identity.sender.encryptionpolicy': 2 });
+      if (failure === 'account') runtime.MailServices.accounts.accounts = [];
+      const results = [];
+      for (const name of ['sendMail', 'dryRunCompose']) {
+        const response = await dispatchHttpBody(state, JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+            name, arguments: { ...args, attachments: ['/home/user/.env'] },
+          },
+        }));
+        const result = JSON.parse(response.result.content[0].text);
+        results.push(name === 'sendMail' ? result.error : result.blockers[0]);
+        if (name === 'dryRunCompose') assert.equal(result.blockers.length, 1);
+      }
+      assert.equal(results[0], results[1]);
+      assert.match(results[0], { block: /blocks skipReview/, identity: /unknown identity/,
+        encryption: /requires encryption/, account: /owning account/, attachment: /Attachments refused/ }[failure]);
+      assert.equal(state.writes + state.decodes + state.native + state.params + state.fields + state.sent + state.windows, 0);
+    }
+  });
+
+  it('runs real restricted-account fallback, owning-account resolution and identity format defaults', () => {
+    const { runtime } = makeOutboundMailRuntime();
+    const blocked = { key: 'blocked', defaultIdentity: { key: 'blocked-id', email: 'blocked@example.com' } };
+    const allowed = { key: 'allowed', defaultIdentity: { key: 'fallback', email: 'fallback@example.com', fullName: 'Fallback', composeHtml: true } };
+    for (const account of [blocked, allowed]) account.identities = [account.defaultIdentity];
+    runtime.MailServices.accounts = { accounts: [blocked, allowed], defaultAccount: blocked };
+    runtime.getAccessibleAccounts = () => [allowed];
+    runtime.isAccountAllowed = key => key === 'allowed';
+    runtime.Ci.nsIMsgCompFormat = { Default: 0, HTML: 1, PlainText: 2 };
+    vm.runInContext([
+      getMarkedApiSnippet('function findIdentityIn(', '/** Creates an nsIFile instance'),
+      getMarkedApiSnippet('// BEGIN COMPOSE IDENTITY HELPER', '// END COMPOSE IDENTITY HELPER'),
+      getMarkedApiSnippet('// BEGIN COMPOSE FORMAT HELPER', '// END COMPOSE FORMAT HELPER'),
+    ].join('\n'), runtime);
+    for (const isHtml of [undefined, null, true, false]) {
+      const result = runtime.dryRunCompose({ ...args, isHtml });
+      assert.equal(result.wouldSucceed, true);
+      assert.deepEqual(JSON.parse(JSON.stringify(result.resolvedIdentity)), { id: 'fallback', email: 'fallback@example.com', name: 'Fallback' });
+      assert.equal(result.isHtml, isHtml !== false);
+      assert.equal(runtime.prepareCompose({ ...args, isHtml }).accountKey, 'allowed');
+    }
+    assert.match(runtime.dryRunCompose({ ...args, from: blocked.defaultIdentity.email }).blockers[0], /restricted account/);
+    assert.match(runtime.dryRunCompose({ ...args, from: 'unknown' }).blockers[0], /unknown identity/);
+    assert.equal(runtime.dryRunCompose({ ...args, from: 'FALLBACK@example.com' }).wouldSucceed, true);
+  });
+});
+
+
+describe('Direct send recipient preflight', () => {
+  const base = { to: '', subject: 'subject', body: 'body', skipReview: true };
+  const group = 'Team: "Doe, Jane" <j@example.com>, k@example.com;';
+  const emptyGroup = 'Undisclosed:;';
+  const auto = 'archive@example.com';
+  const caller = 'other@example.com';
+  for (const field of ['cc', 'bcc']) {
+    it(`deduplicates caller ${field} even when its enabled automatic list is empty`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime();
+      let merges = 0;
+      runtime.setComposeIdentity = params => { params.identity = {
+        key: 'sender', doCc: field === 'cc', doBcc: field === 'bcc', doCcList: '', doBccList: '',
+      }; };
+      runtime.MailServices.headerParser = {
+        removeDuplicateAddresses(header, automatic) {
+          assert.equal(header, `${caller}, ${caller}`);
+          assert.equal(automatic, '');
+          merges++;
+          return caller;
+        },
+        parseDecodedHeader(header, preserveGroups) {
+          assert.equal(header, caller);
+          assert.equal(preserveGroups, false);
+          return [{ email: caller }];
+        },
+      };
+      const request = { ...base, [field]: `${caller}, ${caller}` };
+      const dry = runtime.dryRunCompose(request);
+      assert.equal(dry.wouldSucceed, true);
+      assert.equal(dry.recipients[field], 1);
+      assert.equal(state.sent + state.writes + state.decodes + state.native + state.params, 0);
+      assert.equal((await runtime.composeMail(request)).success, true);
+      assert.equal(merges, 2);
+      assert.equal(state.sent, 1);
+    });
+  }
+  for (const config of [
+    { to: '', expected: 0 },
+    { to: '   ', expected: 0 },
+    { to: emptyGroup, expected: 0 },
+    { to: group, expected: 2 },
+    { identity: { doCc: true, doCcList: auto }, expected: 1, field: 'cc' },
+    { identity: { doBcc: true, doBccList: auto }, expected: 1, field: 'bcc' },
+    { identity: { doCc: false, doCcList: auto, doBcc: false, doBccList: auto }, expected: 0 },
+    { identity: { doCc: true, doCcList: emptyGroup }, expected: 0 },
+    { cc: auto + ', ' + caller, identity: { doCc: true, doCcList: auto }, expected: 2, field: 'cc' },
+  ]) {
+    it(`counts native flattened mailboxes and automatic fields: ${JSON.stringify(config)}`, async () => {
+      const { runtime, state } = makeOutboundMailRuntime();
+      runtime.setComposeIdentity = params => { params.identity = { key: 'sender', ...config.identity }; };
+      const merged = auto + ', ' + caller;
+      runtime.MailServices.headerParser = {
+        parseDecodedHeader(header, preserveGroups) {
+          assert.equal(preserveGroups, false);
+          const mailboxes = new Map([
+            [emptyGroup, []], [group, ['j@example.com', 'k@example.com']],
+            [auto, [auto]], [merged, [auto, caller]], ['   ', []],
+          ]).get(header);
+          assert.ok(mailboxes, `Unexpected header ${header}`);
+          return mailboxes.map(email => ({ email }));
+        },
+        removeDuplicateAddresses(header, automatic) {
+          assert.equal(automatic, config.identity.doCcList || config.identity.doBccList);
+          assert.ok(header === '' || header === merged);
+          return header ? caller : '';
+        },
+      };
+      const args = { ...base, to: config.to || '', cc: config.cc || '' };
+      const dry = runtime.dryRunCompose(args);
+      assert.equal(dry.wouldSucceed, config.expected > 0);
+      assert.equal(state.writes + state.native + state.params + state.fields + state.sent + state.windows, 0);
+      if (config.expected) {
+        assert.equal(dry.recipients[config.field || 'to'], config.expected);
+        const real = await runtime.composeMail(args);
+        assert.equal(real.success, true);
+        assert.equal(state.sent, 1);
+      } else {
+        const real = runtime.composeMail({ ...args, attachments: ['/home/user/.env'] });
+        assert.equal(real.error, dry.blockers[0]);
+        assert.match(real.error, /at least one recipient/);
+        assert.equal(state.fileCalls + state.writes + state.native + state.params + state.fields + state.sent, 0);
+        assert.equal(runtime.dryRunCompose({ ...args, skipReview: false }).wouldSucceed, true);
+      }
+    });
+  }
+});
+
+describe('Conservative compose size preflight', () => {
+  const thresholdPref = 'mailnews.message_warning_size';
+  const args = { to: 'to@example.com', subject: 'subject', body: 'Body', skipReview: true };
+  // Reuse the production signature/format loaders and instrumented filesystem.
+  function makeRuntime({ identity = {}, prefs = {} } = {}) {
+    const h = makeOutboundMailRuntime();
+    h.runtime.Services.prefs = makeDirectSendPrefs(prefs);
+    h.runtime.setComposeIdentity = params => {
+      params.identity = { key: 'sender', email: 'sender@example.com', composeHtml: false, ...identity };
+    };
+    h.runtime.Ci.nsIMsgCompFormat = { Default: 0, HTML: 1, PlainText: 2 };
+    vm.runInContext([
+      getMarkedApiSnippet('function escapeHtml(s) {', '// BEGIN MESSAGE TEXT CONVERSION'),
+      getMarkedApiSnippet('// BEGIN COMPOSE HTML FRAGMENT', '// END COMPOSE HTML FRAGMENT'),
+      getMarkedApiSnippet('// BEGIN COMPOSE SIGNATURE HELPERS', '// END COMPOSE SIGNATURE HELPERS'),
+      getMarkedApiSnippet('// BEGIN COMPOSE FORMAT HELPER', '// END COMPOSE FORMAT HELPER'),
+    ].join('\n'), h.runtime);
+    return h;
+  }
+  const noExecution = state => {
+    assert.equal(state.writes + state.decodes + state.native + state.params + state.fields + state.sent + state.windows + state.drafts, 0);
+    assert.equal(state.removed.length, 0);
+  };
+
+  it('uses padded base64 with 72-column CRLFs, including exact multiples and the terminal blank line', () => {
+    const { runtime } = makeRuntime();
+    for (const [raw, expected] of [[0, 2], [1, 6], [2, 6], [3, 6], [4, 10], [53, 76], [54, 76], [55, 80], [108, 150]]) {
+      assert.equal(runtime.getComposeBase64Size(raw), expected, String(raw));
+    }
+    const textSize = runtime.getComposeTextSize(1000);
+    assert.ok(textSize > 3000, 'QP and soft breaks exceed the tempting base64-only bound');
+  });
+
+  it('allows equality and refuses only greater estimates, with the same dry-run blocker before materialization', async () => {
+    const attachments = [{ name: 'payload.bin', contentType: 'application/octet-stream', base64: Buffer.alloc(54).toString('base64') }];
+    const { runtime } = makeRuntime();
+    const estimate = runtime.dryRunCompose({ ...args, attachments }).estimatedEncodedBytes;
+    assert.ok(estimate > 76);
+    for (const [threshold, allowed] of [[estimate - 1, false], [estimate, true], [estimate + 1, true]]) {
+      const h = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const dry = h.runtime.dryRunCompose({ ...args, attachments });
+      assert.equal(dry.wouldSucceed, allowed);
+      assert.equal(dry.estimatedEncodedBytes, estimate);
+      assert.equal(dry.warningThresholdBytes, threshold);
+      noExecution(h.state);
+      const real = await h.runtime.composeMail({ ...args, attachments });
+      if (allowed) {
+        assert.equal(real.success, true, real.error);
+        assert.equal(h.state.sent, 1);
+        assert.equal(h.state.writes, 1);
+      } else {
+        assert.equal(real.error, dry.blockers[0]);
+        assert.match(real.error, /skipReview: false/);
+        noExecution(h.state);
+      }
+    }
+  });
+
+  for (const threshold of [0, -1]) {
+    it(`does not gate sizes when the user's threshold is ${threshold}`, () => {
+      const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const result = runtime.dryRunCompose({ ...args, body: 'x'.repeat(1000000) });
+      assert.equal(result.wouldSucceed, true);
+      assert.ok(result.estimatedEncodedBytes > 3000000);
+      assert.equal(result.warningThresholdBytes, threshold);
+      noExecution(state);
+    });
+  }
+
+  for (const threshold of [undefined, 'large', 1.5, NaN]) {
+    it(`fails closed on an invalid threshold (${String(threshold)}) while review remains available`, () => {
+      const { runtime, state } = makeRuntime({ prefs: { [thresholdPref]: threshold } });
+      const direct = runtime.dryRunCompose(args);
+      assert.equal(direct.wouldSucceed, false);
+      assert.match(direct.blockers[0], /threshold could not be read/);
+      const review = runtime.dryRunCompose({ ...args, skipReview: false });
+      assert.equal(review.wouldSucceed, true);
+      assert.match(review.warnings[0], /threshold could not be read/);
+      assert.equal(runtime.composeMail(args).error, direct.blockers[0]);
+      noExecution(state);
+    });
+  }
+
+  it('refuses failed preference reads without writing preferences or executing compose', () => {
+    const { runtime, state } = makeRuntime();
+    const prefs = runtime.Services.prefs;
+    runtime.Services.prefs = new Proxy(prefs, {
+      get(target, key) {
+        if (String(key).startsWith('set')) return () => assert.fail('must not change preferences');
+        if (key === 'getIntPref') return name => {
+          if (name === thresholdPref) throw new Error('unreadable');
+          return target[key](name);
+        };
+        return target[key];
+      },
+    });
+    const dry = runtime.dryRunCompose(args);
+    assert.match(dry.blockers[0], /threshold could not be read/);
+    noExecution(state);
+  });
+
+  it('bounds prepared UTF-8, HTML entities, newlines and appended signatures, with distinct input length', () => {
+    const body = 'Zażółć 😀\n<&>\r\n';
+    const identity = { htmlSigText: 'Signed 😀\nSupport', composeHtml: true };
+    const { runtime, state } = makeRuntime({ identity });
+    for (const isHtml of [false, true, null]) {
+      const request = { ...args, body, isHtml };
+      const plan = runtime.prepareCompose(request);
+      const result = runtime.dryRunCompose(request);
+      assert.equal(result.inputBodyLength, body.length);
+      assert.ok(result.estimatedEncodedBytes > Buffer.byteLength(plan.body));
+      assert.ok(plan.body.includes('Signed 😀'));
+      if (isHtml !== false) assert.ok(plan.body.startsWith('<html>'));
+      assert.ok(result.estimatedEncodedBytes > runtime.dryRunCompose({ ...request, includeSignature: false }).estimatedEncodedBytes);
+      assert.equal(result.isHtml, isHtml !== false);
+    }
+    noExecution(state);
+  });
+
+  it('blocks body-only and signature-only messages, and warns for a dry review', () => {
+    for (const config of [
+      { request: { body: 'é\n'.repeat(10000) } },
+      { identity: { htmlSigText: 'é\n'.repeat(10000) }, request: {} },
+    ]) {
+      const h = makeRuntime({ identity: config.identity, prefs: { [thresholdPref]: 100000 } });
+      const dry = h.runtime.dryRunCompose({ ...args, ...config.request });
+      assert.equal(dry.wouldSucceed, false);
+      assert.ok(dry.estimatedEncodedBytes > 100000);
+      assert.equal(h.runtime.composeMail({ ...args, ...config.request }).error, dry.blockers[0]);
+      const review = h.runtime.dryRunCompose({ ...args, ...config.request, skipReview: false });
+      assert.equal(review.wouldSucceed, true);
+      assert.equal(review.warnings.length, 1);
+      noExecution(h.state);
+    }
+  });
+
+  it('includes dynamic subjects, Bcc, filenames, custom headers, organization, Reply-To and vCards', () => {
+    const baseline = makeRuntime().runtime.dryRunCompose(args).estimatedEncodedBytes;
+    const long = '😀'.repeat(1000);
+    for (const config of [
+      { request: { subject: long } }, { request: { bcc: long + '@example.com' } },
+      { request: { attachments: [{ name: long, base64: 'QQ==' }] } },
+      { identity: { organization: long } }, { identity: { replyTo: long + '@example.com' } },
+      { identity: { attachVCard: true, escapedVCard: long } },
+      { prefs: { 'mail.identity.sender.headers': 'custom', 'mail.identity.sender.header.custom': 'X-Long: ' + long } },
+      { prefs: { 'mail.identity.default.headers': 'custom', 'mail.identity.default.header.custom': 'X-Long: ' + long } },
+      { prefs: { 'general.useragent.override': long } },
+    ]) {
+      const { runtime, state } = makeRuntime(config);
+      assert.ok(runtime.dryRunCompose({ ...args, ...config.request }).estimatedEncodedBytes > baseline + 1000);
+      noExecution(state);
+    }
+  });
+
+  it('ignores disabled automatic recipient lists when counting and bounding identity content', () => {
+    const baseline = makeRuntime().runtime.dryRunCompose(args).estimatedEncodedBytes;
+    const { runtime, state } = makeRuntime();
+    // Preserve getters rather than spreading this identity in the fixture.
+    const identity = { key: 'sender', email: 'sender@example.com', composeHtml: false, doCc: false, doBcc: false };
+    for (const name of ['doCcList', 'doBccList']) Object.defineProperty(identity, name, {
+      get() { throw new Error('Disabled recipient list must not be read'); },
+    });
+    runtime.setComposeIdentity = params => { params.identity = identity; };
+    const dry = runtime.dryRunCompose(args);
+    assert.equal(dry.wouldSucceed, true);
+    assert.equal(dry.estimatedEncodedBytes, baseline);
+    assert.equal(dry.recipients.cc + dry.recipients.bcc, 0);
+    noExecution(state);
+  });
+
+  it('fails closed on unbounded identity content and raw snapshot lengths; nonpositive thresholds still disable the gate', () => {
+    for (const config of [
+      { identity: { attachVCard: true } },
+      { identity: { organization: 42 } },
+      { prefs: { 'mail.identity.sender.headers': 42 } },
+    ]) {
+      const h = makeRuntime(config);
+      const direct = h.runtime.dryRunCompose(args);
+      assert.equal(direct.estimatedEncodedBytes, null);
+      assert.match(direct.blockers[0], /could not be safely bounded/);
+      assert.equal(h.runtime.dryRunCompose({ ...args, skipReview: false }).warnings.length, 1);
+      noExecution(h.state);
+      const disabled = makeRuntime({ ...config, prefs: { ...config.prefs, [thresholdPref]: 0 } });
+      assert.equal(disabled.runtime.dryRunCompose(args).wouldSucceed, true);
+    }
+    const { runtime } = makeRuntime();
+    for (const inheritedRawBytes of [undefined, NaN, Infinity, -1, Number.MAX_SAFE_INTEGER]) {
+      const size = runtime.assessComposeSize({ identity: { key: 'sender' }, body: '', inheritedRawBytes });
+      assert.equal(size.estimatedEncodedBytes, null);
+      assert.match(size.warning, /could not be safely bounded/);
+    }
+  });
+});
+
+describe('Validation: searchAttachments', () => {
+  for (const [name, maximum] of [['maxResults', 200], ['scanCap', 50000]]) {
+    it(`accepts both bounds for ${name}`, () => {
+      for (const value of [1, maximum]) {
+        assert.deepStrictEqual(validateProductionToolArgs('searchAttachments', { nameContains: 'x', [name]: value }), []);
+      }
+    });
+  }
+
+  for (const name of ['nameContains', 'contentType', 'folderPath']) {
+    it(`rejects an empty ${name}`, () => {
+      const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', [name]: '' });
+      assert.equal(errors.length, 1);
+      assert.match(errors[0], /at least 1/);
+    });
+  }
+
+  it('accepts only nameContains (no required params)', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'invoice' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts only contentType', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { contentType: 'application/pdf' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts both filters plus folderPath, maxResults, scanCap', () => {
+    const errors = validateProductionToolArgs('searchAttachments', {
+      nameContains: 'invoice',
+      contentType: 'application/pdf',
+      folderPath: 'imap://user@server/INBOX',
+      maxResults: 100,
+      scanCap: 10000,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // required: [] -- no params are mandatory at the validation layer. The
+  // "provide at least one filter" rule is enforced by the handler, not the
+  // schema, so an empty args object passes validation.
+  it('accepts an empty args object (the filter rule lives in the handler)', () => {
+    const errors = validateProductionToolArgs('searchAttachments', {});
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects nameContains of the wrong type', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 42 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects contentType of the wrong type', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { contentType: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('accepts integer maxResults', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', maxResults: 50 });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects non-integer (float) maxResults', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', maxResults: 12.5 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string maxResults', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { nameContains: 'x', maxResults: '50' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects non-integer (float) scanCap', () => {
+    const errors = validateProductionToolArgs('searchAttachments', { contentType: 'image/', scanCap: 99.9 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validateProductionToolArgs('searchAttachments', {
+      nameContains: 'invoice',
+      regex: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: regex/);
+  });
+});
